@@ -16,6 +16,9 @@ pub struct ColumnInfo {
     pub name: String,
     #[serde(rename = "type")]
     pub col_type: String,
+    /// ClickHouse default_kind: '', 'DEFAULT', 'MATERIALIZED', 'ALIAS', 'EPHEMERAL'
+    #[serde(default)]
+    pub default_kind: String,
 }
 
 /// The kind of column usable as a CDC watermark.
@@ -122,13 +125,36 @@ pub async fn apply_ddl(client: &ClickHouseClient, ddl: &str) -> Result<()> {
     client.execute_no_db(ddl).await
 }
 
-/// Retrieve the column list for a table.
+/// Fetch the current MAX value of a watermark column from the source table.
+/// Returns None if the table is empty or the query fails.
+pub async fn fetch_max_watermark(
+    client: &ClickHouseClient,
+    table: &str,
+    col: &str,
+    is_datetime: bool,
+) -> Option<String> {
+    let sql = format!(
+        "SELECT max(`{}`) AS m FROM `{}`.`{}`",
+        col,
+        client.config.database,
+        table
+    );
+    let val = client.query_scalar(&sql).await.ok()?;
+    if val.is_empty() || val == "0" || val == "1970-01-01 00:00:00" {
+        return None;
+    }
+    // DateTime values come back without quotes; keep as-is for the watermark store
+    let _ = is_datetime; // no transformation needed
+    Some(val)
+}
+
+/// Retrieve the column list for a table, including default_kind to detect MATERIALIZED columns.
 pub async fn get_columns(
     client: &ClickHouseClient,
     table: &str,
 ) -> Result<Vec<ColumnInfo>> {
     let sql = format!(
-        "SELECT name, type \
+        "SELECT name, type, default_kind \
          FROM system.columns \
          WHERE database = '{}' AND table = '{}' \
          ORDER BY position",
@@ -141,6 +167,7 @@ pub async fn get_columns(
         name: String,
         #[serde(rename = "type")]
         col_type: String,
+        default_kind: String,
     }
 
     let rows: Vec<Row> = client.query_typed(&sql).await?;
@@ -149,6 +176,7 @@ pub async fn get_columns(
         .map(|r| ColumnInfo {
             name: r.name,
             col_type: r.col_type,
+            default_kind: r.default_kind,
         })
         .collect())
 }
@@ -156,17 +184,26 @@ pub async fn get_columns(
 /// Pick the best watermark column for CDC polling.
 ///
 /// Priority:
-/// 1. DateTime / DateTime64 column named something like `updated_at`, `modified_at`, `event_time`
+/// 1. DateTime / DateTime64 column with a preferred name (`updated_at`, `modified_at`, …)
 /// 2. Any DateTime / DateTime64 column
-/// 3. UInt64 column named `version`, `_version`, `id`
-/// 4. Any UInt64 column
+/// 3. UInt64/UInt32/Int64 column with a preferred name (`_version`, `version`, `id`)
+/// 4. Any UInt64/UInt32/Int64 column
 /// 5. Nothing
+///
+/// MATERIALIZED and ALIAS columns are always excluded — they are computed
+/// constants (e.g. `_version UInt64 MATERIALIZED 1`) and cannot track real changes.
 pub fn pick_watermark(columns: &[ColumnInfo]) -> WatermarkKind {
     let preferred_datetime = ["updated_at", "modified_at", "event_time", "created_at", "timestamp"];
     let preferred_uint = ["_version", "version", "id"];
 
+    // Only consider real stored columns
+    let real: Vec<&ColumnInfo> = columns
+        .iter()
+        .filter(|c| !is_virtual(&c.default_kind))
+        .collect();
+
     // 1. Preferred datetime name
-    for col in columns {
+    for col in &real {
         if is_datetime(&col.col_type) {
             let lower = col.name.to_lowercase();
             if preferred_datetime.iter().any(|&p| lower == p) {
@@ -175,13 +212,13 @@ pub fn pick_watermark(columns: &[ColumnInfo]) -> WatermarkKind {
         }
     }
     // 2. Any datetime
-    for col in columns {
+    for col in &real {
         if is_datetime(&col.col_type) {
             return WatermarkKind::DateTime(col.name.clone());
         }
     }
     // 3. Preferred uint name
-    for col in columns {
+    for col in &real {
         if is_uint(&col.col_type) {
             let lower = col.name.to_lowercase();
             if preferred_uint.iter().any(|&p| lower == p) {
@@ -189,13 +226,18 @@ pub fn pick_watermark(columns: &[ColumnInfo]) -> WatermarkKind {
             }
         }
     }
-    // 4. Any UInt64
-    for col in columns {
+    // 4. Any uint
+    for col in &real {
         if is_uint(&col.col_type) {
             return WatermarkKind::UInt64(col.name.clone());
         }
     }
     WatermarkKind::None
+}
+
+/// Returns true for MATERIALIZED and ALIAS columns — they are computed, not stored.
+fn is_virtual(default_kind: &str) -> bool {
+    matches!(default_kind, "MATERIALIZED" | "ALIAS" | "EPHEMERAL")
 }
 
 fn is_datetime(t: &str) -> bool {
@@ -298,6 +340,15 @@ mod tests {
         ColumnInfo {
             name: name.to_string(),
             col_type: col_type.to_string(),
+            default_kind: String::new(),
+        }
+    }
+
+    fn materialized_col(name: &str, col_type: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            col_type: col_type.to_string(),
+            default_kind: "MATERIALIZED".to_string(),
         }
     }
 
@@ -412,6 +463,58 @@ mod tests {
         match pick_watermark(&cols) {
             WatermarkKind::UInt64(c) => assert_eq!(c, "id"),
             other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pick_watermark_skips_materialized_version() {
+        // _version is MATERIALIZED — must not be chosen even though it matches preferred name
+        let cols = vec![
+            col("id", "Int32"),
+            materialized_col("_version", "UInt64"),
+        ];
+        // Only non-preferred, non-uint real column is id (Int32 not uint) → None
+        assert!(matches!(pick_watermark(&cols), WatermarkKind::None));
+    }
+
+    #[test]
+    fn pick_watermark_skips_materialized_falls_back_to_real_uint() {
+        let cols = vec![
+            materialized_col("_version", "UInt64"),
+            col("sequence_num", "UInt64"),
+        ];
+        match pick_watermark(&cols) {
+            WatermarkKind::UInt64(c) => assert_eq!(c, "sequence_num"),
+            other => panic!("expected real uint, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pick_watermark_skips_materialized_datetime() {
+        let cols = vec![
+            materialized_col("event_time", "DateTime"),
+            col("id", "UInt64"),
+        ];
+        // event_time is MATERIALIZED → skip; id is real UInt64 → fallback
+        match pick_watermark(&cols) {
+            WatermarkKind::UInt64(c) => assert_eq!(c, "id"),
+            other => panic!("expected uint fallback, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pick_watermark_alias_also_excluded() {
+        let cols = vec![
+            ColumnInfo {
+                name: "updated_at".to_string(),
+                col_type: "DateTime".to_string(),
+                default_kind: "ALIAS".to_string(),
+            },
+            col("real_ts", "DateTime"),
+        ];
+        match pick_watermark(&cols) {
+            WatermarkKind::DateTime(c) => assert_eq!(c, "real_ts"),
+            other => panic!("expected real datetime, got: {:?}", other),
         }
     }
 }

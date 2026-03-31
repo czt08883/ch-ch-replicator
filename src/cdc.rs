@@ -8,7 +8,7 @@ use crate::checkpoint::Checkpoint;
 use crate::client::ClickHouseClient;
 use crate::config::Config;
 use crate::error::{ReplicatorError, Result};
-use crate::schema::{get_columns, pick_watermark, TableInfo, WatermarkKind};
+use crate::schema::{fetch_max_watermark, get_columns, pick_watermark, TableInfo, WatermarkKind};
 
 /// CDC engine: polls each table for changes and replicates them to the target.
 pub struct CdcEngine {
@@ -50,18 +50,46 @@ impl CdcEngine {
             let cols = get_columns(&self.src, &t.name).await.unwrap_or_default();
             let wm_kind = pick_watermark(&cols);
 
-            // Seed watermark from checkpoint if available
+            // Seed watermark: checkpoint wins; otherwise query MAX from source
             let (wm_col, wm_val) = {
                 let cp = self.checkpoint.lock().await;
                 if let Some(tc) = cp.table(&t.name) {
                     if !tc.watermark_column.is_empty() {
+                        // Resume from saved position
                         (tc.watermark_column.clone(), tc.cdc_watermark.clone())
                     } else {
-                        // Derive initial watermark from the wm_kind
                         watermark_initial_value(&wm_kind)
                     }
                 } else {
                     watermark_initial_value(&wm_kind)
+                }
+            };
+
+            // If we ended up with the zero/epoch sentinel, try to seed from
+            // the actual current MAX on the source so CDC doesn't re-replicate
+            // rows that were already copied during initial sync.
+            let (wm_col, wm_val) = match &wm_kind {
+                WatermarkKind::None => (wm_col, wm_val),
+                WatermarkKind::DateTime(col) | WatermarkKind::UInt64(col) => {
+                    let is_dt = matches!(&wm_kind, WatermarkKind::DateTime(_));
+                    let sentinel = if is_dt { "1970-01-01 00:00:00" } else { "0" };
+                    if wm_val == sentinel {
+                        // No checkpoint — fetch real MAX so we don't re-sync initial data
+                        let col = col.clone();
+                        let max = fetch_max_watermark(&self.src, &t.name, &col, is_dt).await;
+                        match max {
+                            Some(v) => {
+                                info!(
+                                    "Table '{}': seeding CDC watermark '{}' = '{}' from source MAX",
+                                    t.name, col, v
+                                );
+                                (col, v)
+                            }
+                            None => (wm_col, wm_val),
+                        }
+                    } else {
+                        (wm_col, wm_val)
+                    }
                 }
             };
 
