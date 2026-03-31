@@ -25,6 +25,14 @@ impl ClickHouseClient {
         Ok(Self { client, config })
     }
 
+    /// Build the base URL with auth params — without a database (safe to use before DB exists).
+    fn base_params_no_db(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("user", self.config.user.clone()),
+            ("password", self.config.password.clone()),
+        ]
+    }
+
     /// Build the base URL with auth params.
     fn base_params(&self) -> Vec<(&'static str, String)> {
         vec![
@@ -32,6 +40,25 @@ impl ClickHouseClient {
             ("password", self.config.password.clone()),
             ("database", self.config.database.clone()),
         ]
+    }
+
+    /// Verify connectivity without referencing any specific database.
+    /// Safe to call even when the target database does not yet exist.
+    pub async fn ping(&self) -> Result<()> {
+        let url = &self.config.http_url;
+        let mut params = self.base_params_no_db();
+        params.push(("query", "SELECT 1".to_string()));
+
+        let response = self.client.get(url).query(&params).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await?;
+            return Err(ReplicatorError::ClickHouse(format!(
+                "ping failed ({}): {}",
+                status, body
+            )));
+        }
+        Ok(())
     }
 
     /// Execute a query that returns rows in `FORMAT JSONEachRow`.

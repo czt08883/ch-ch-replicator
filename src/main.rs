@@ -161,13 +161,9 @@ async fn run(cli: Cli) -> Result<(), ReplicatorError> {
 
 /// Verify that we can connect to a ClickHouse instance.
 async fn check_connectivity(client: &ClickHouseClient, label: &str) -> Result<(), ReplicatorError> {
-    match client.query_scalar("SELECT 1").await {
-        Ok(v) if v == "1" => {
-            info!("{} ClickHouse is reachable (version check OK)", label);
-            Ok(())
-        }
-        Ok(v) => {
-            info!("{} ClickHouse responded: {}", label, v);
+    match client.ping().await {
+        Ok(()) => {
+            info!("{} ClickHouse is reachable", label);
             Ok(())
         }
         Err(e) => {
