@@ -1,6 +1,6 @@
 [package]
 name = "ch-ch-replicator"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 
 [[bin]]
@@ -8,6 +8,7 @@ name = "ch-ch-replicator"
 path = "src/main.rs"
 
 [dependencies]
+bytes = "1"
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
