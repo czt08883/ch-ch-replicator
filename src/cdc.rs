@@ -103,6 +103,7 @@ impl CdcEngine {
                 wm_kind,
                 wm_col,
                 wm_val,
+                sorting_key: t.sorting_key.clone(),
             });
         }
 
@@ -221,7 +222,7 @@ impl CdcEngine {
         // Fetch exactly the new rows (LIMIT from the end of known range)
         let body = self
             .src
-            .select_batch_raw(&state.name, dst_count, diff as usize + 1)
+            .select_batch_raw(&state.name, dst_count, diff as usize + 1, &state.sorting_key)
             .await?;
 
         let line_count = count_jsonl_lines(&body);
@@ -255,6 +256,7 @@ struct TableState {
     #[allow(dead_code)]
     wm_col: String,
     wm_val: String,
+    sorting_key: String,
 }
 
 /// Return the initial watermark placeholder value based on kind.

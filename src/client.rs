@@ -173,10 +173,16 @@ impl ClickHouseClient {
     }
 
     /// Query a batch of rows as raw JSONEachRow text (for bulk transfer).
-    pub async fn select_batch_raw(&self, table: &str, offset: u64, limit: usize) -> Result<String> {
+    /// If `order_by` is non-empty, adds an ORDER BY clause for deterministic pagination.
+    pub async fn select_batch_raw(&self, table: &str, offset: u64, limit: usize, order_by: &str) -> Result<String> {
+        let order_clause = if order_by.is_empty() {
+            String::new()
+        } else {
+            format!(" ORDER BY {}", order_by)
+        };
         let sql = format!(
-            "SELECT * FROM `{}`.`{}` LIMIT {} OFFSET {} FORMAT JSONEachRow",
-            self.config.database, table, limit, offset
+            "SELECT * FROM `{}`.`{}`{} LIMIT {} OFFSET {} FORMAT JSONEachRow",
+            self.config.database, table, order_clause, limit, offset
         );
         debug!("select_batch_raw: {}", sql);
 

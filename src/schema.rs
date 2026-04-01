@@ -1,13 +1,16 @@
 use crate::client::ClickHouseClient;
 use crate::error::{ReplicatorError, Result};
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Metadata about a single ClickHouse table.
 #[derive(Debug, Clone)]
 pub struct TableInfo {
     pub name: String,
     pub engine: String,
+    /// The table's sorting key expression (from `system.tables.sorting_key`).
+    /// Empty string for non-MergeTree engines that have no sorting key.
+    pub sorting_key: String,
 }
 
 /// Column metadata for a table.
@@ -32,7 +35,7 @@ pub enum WatermarkKind {
 /// Returns the list of ordinary tables in the source database, skipping views/MViews.
 pub async fn list_tables(client: &ClickHouseClient) -> Result<Vec<TableInfo>> {
     let sql = format!(
-        "SELECT name, engine \
+        "SELECT name, engine, sorting_key \
          FROM system.tables \
          WHERE database = '{}' \
            AND engine NOT IN ('View','MaterializedView','LiveView','WindowView') \
@@ -44,6 +47,7 @@ pub async fn list_tables(client: &ClickHouseClient) -> Result<Vec<TableInfo>> {
     struct Row {
         name: String,
         engine: String,
+        sorting_key: String,
     }
 
     let rows: Vec<Row> = client.query_typed(&sql).await?;
@@ -52,6 +56,7 @@ pub async fn list_tables(client: &ClickHouseClient) -> Result<Vec<TableInfo>> {
         .map(|r| TableInfo {
             name: r.name,
             engine: r.engine,
+            sorting_key: r.sorting_key,
         })
         .collect())
 }
@@ -59,6 +64,7 @@ pub async fn list_tables(client: &ClickHouseClient) -> Result<Vec<TableInfo>> {
 /// Adapt a DDL string from the source database to the destination database.
 /// - Replaces `src_db`.`table` with `dest_db`.`table`
 /// - Ensures the statement uses `CREATE TABLE IF NOT EXISTS`
+/// - Rewrites deprecated MergeTree engine syntax to the modern ORDER BY / PARTITION BY form
 pub(crate) fn adapt_ddl(ddl: &str, src_db: &str, table: &str, dest_db: &str) -> String {
     let ddl = ddl.replace(
         &format!("`{}`.`{}`", src_db, table),
@@ -69,10 +75,138 @@ pub(crate) fn adapt_ddl(ddl: &str, src_db: &str, table: &str, dest_db: &str) -> 
         &format!("{}.{}", src_db, table),
         &format!("`{}`.`{}`", dest_db, table),
     );
-    if ddl.contains("CREATE TABLE IF NOT EXISTS") {
+    let ddl = if ddl.contains("CREATE TABLE IF NOT EXISTS") {
         ddl
     } else {
         ddl.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
+    };
+    rewrite_deprecated_engine_syntax(&ddl)
+}
+
+/// Convert deprecated MergeTree engine syntax to the modern ORDER BY / PARTITION BY form.
+///
+/// Old (pre-1.1.54382):
+///   `ENGINE = ReplacingMergeTree(date_col, sort_key, granularity[, extra...])`
+///
+/// Modern equivalent:
+///   `ENGINE = ReplacingMergeTree([extra...])`
+///   `ORDER BY sort_key`
+///   `PARTITION BY toYYYYMM(date_col)`
+///   `SETTINGS index_granularity = granularity`
+///
+/// Detection heuristic: the ENGINE(...) call has ≥ 3 top-level comma-separated
+/// arguments where the third is a plain integer (the index_granularity).
+fn rewrite_deprecated_engine_syntax(ddl: &str) -> String {
+    const ENGINE_KW: &str = "ENGINE = ";
+    let engine_pos = match ddl.find(ENGINE_KW) {
+        Some(p) => p,
+        None => return ddl.to_string(),
+    };
+
+    let after = &ddl[engine_pos + ENGINE_KW.len()..];
+
+    let paren_offset = match after.find('(') {
+        Some(p) => p,
+        None => return ddl.to_string(),
+    };
+
+    let engine_name = after[..paren_offset].trim();
+    if !engine_name.ends_with("MergeTree") {
+        return ddl.to_string();
+    }
+
+    // Locate the content inside ENGINE(...)
+    let args_start = engine_pos + ENGINE_KW.len() + paren_offset + 1;
+    let rest = &ddl[args_start..];
+    let close_offset = match find_matching_close_paren(rest) {
+        Some(p) => p,
+        None => return ddl.to_string(),
+    };
+
+    let args_str = &rest[..close_offset];
+    let args = split_engine_args(args_str);
+
+    // Deprecated form has ≥ 3 args; the 3rd must be a plain integer (index_granularity).
+    if args.len() < 3 {
+        return ddl.to_string();
+    }
+    let granularity_str = args[2].trim();
+    if granularity_str.is_empty() || !granularity_str.chars().all(|c| c.is_ascii_digit()) {
+        return ddl.to_string();
+    }
+
+    let date_col = args[0].trim();
+    let sort_key = args[1].trim();
+    let granularity: u32 = granularity_str.parse().unwrap_or(8192);
+    let engine_inner = build_engine_inner(engine_name, &args[3..]);
+
+    let modern = format!(
+        "ENGINE = {}({})\nORDER BY {}\nPARTITION BY toYYYYMM({})\nSETTINGS index_granularity = {}",
+        engine_name, engine_inner, sort_key, date_col, granularity
+    );
+
+    let close_in_ddl = args_start + close_offset;
+    format!("{}{}{}", &ddl[..engine_pos], modern, &ddl[close_in_ddl + 1..])
+}
+
+/// Find the byte offset of the `)` that closes the current nesting level.
+/// `s` must start immediately after the matching `(`.
+fn find_matching_close_paren(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split a comma-separated argument list, respecting nested parentheses.
+fn split_engine_args(s: &str) -> Vec<&str> {
+    let mut args: Vec<&str> = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < s.len() {
+        args.push(&s[start..]);
+    }
+    args
+}
+
+/// Return the arguments to place inside `EngineName(...)` in the modern syntax.
+/// Extra args beyond (date, sort_key, granularity) that belong to the engine itself.
+fn build_engine_inner(engine: &str, extra: &[&str]) -> String {
+    match engine {
+        // ReplacingMergeTree([ver_col])
+        "ReplacingMergeTree" if !extra.is_empty() => extra[0].trim().to_string(),
+        // CollapsingMergeTree(sign_col)
+        "CollapsingMergeTree" if !extra.is_empty() => extra[0].trim().to_string(),
+        // VersionedCollapsingMergeTree(sign_col, ver_col)
+        "VersionedCollapsingMergeTree" if extra.len() >= 2 => {
+            format!("{}, {}", extra[0].trim(), extra[1].trim())
+        }
+        // SummingMergeTree([(columns)])
+        "SummingMergeTree" if !extra.is_empty() => extra[0].trim().to_string(),
+        // GraphiteMergeTree(config_section)
+        "GraphiteMergeTree" if !extra.is_empty() => extra[0].trim().to_string(),
+        _ => String::new(),
     }
 }
 
@@ -183,7 +317,7 @@ pub async fn get_columns(
 
 /// Pick the best watermark column for CDC polling.
 ///
-/// Priority:
+/// Priority (within each tier, non-Nullable columns are preferred over Nullable):
 /// 1. DateTime / DateTime64 column with a preferred name (`updated_at`, `modified_at`, …)
 /// 2. Any DateTime / DateTime64 column
 /// 3. UInt64/UInt32/Int64 column with a preferred name (`_version`, `version`, `id`)
@@ -192,7 +326,29 @@ pub async fn get_columns(
 ///
 /// MATERIALIZED and ALIAS columns are always excluded — they are computed
 /// constants (e.g. `_version UInt64 MATERIALIZED 1`) and cannot track real changes.
+///
+/// Nullable columns *are* considered (e.g. `Nullable(DateTime)`), but a warning
+/// is emitted because rows with NULL watermark values will not be detected by CDC.
 pub fn pick_watermark(columns: &[ColumnInfo]) -> WatermarkKind {
+    let result = pick_watermark_inner(columns);
+
+    // Warn once if the chosen column is Nullable
+    if let WatermarkKind::DateTime(ref name) | WatermarkKind::UInt64(ref name) = &result {
+        if let Some(col) = columns.iter().find(|c| c.name == *name) {
+            if is_nullable(&col.col_type) {
+                warn!(
+                    "Selected Nullable watermark column '{}' (type '{}'). \
+                     Rows with NULL values in this column will not be detected by CDC polling.",
+                    col.name, col.col_type
+                );
+            }
+        }
+    }
+
+    result
+}
+
+fn pick_watermark_inner(columns: &[ColumnInfo]) -> WatermarkKind {
     let preferred_datetime = ["updated_at", "modified_at", "event_time", "created_at", "timestamp"];
     let preferred_uint = ["_version", "version", "id"];
 
@@ -202,34 +358,42 @@ pub fn pick_watermark(columns: &[ColumnInfo]) -> WatermarkKind {
         .filter(|c| !is_virtual(&c.default_kind))
         .collect();
 
-    // 1. Preferred datetime name
-    for col in &real {
-        if is_datetime(&col.col_type) {
-            let lower = col.name.to_lowercase();
-            if preferred_datetime.iter().any(|&p| lower == p) {
+    // 1. Preferred datetime name (non-Nullable first, then Nullable)
+    for nullable in [false, true] {
+        for col in &real {
+            if is_datetime(&col.col_type) && is_nullable(&col.col_type) == nullable {
+                let lower = col.name.to_lowercase();
+                if preferred_datetime.iter().any(|&p| lower == p) {
+                    return WatermarkKind::DateTime(col.name.clone());
+                }
+            }
+        }
+    }
+    // 2. Any datetime (non-Nullable first, then Nullable)
+    for nullable in [false, true] {
+        for col in &real {
+            if is_datetime(&col.col_type) && is_nullable(&col.col_type) == nullable {
                 return WatermarkKind::DateTime(col.name.clone());
             }
         }
     }
-    // 2. Any datetime
-    for col in &real {
-        if is_datetime(&col.col_type) {
-            return WatermarkKind::DateTime(col.name.clone());
-        }
-    }
-    // 3. Preferred uint name
-    for col in &real {
-        if is_uint(&col.col_type) {
-            let lower = col.name.to_lowercase();
-            if preferred_uint.iter().any(|&p| lower == p) {
-                return WatermarkKind::UInt64(col.name.clone());
+    // 3. Preferred uint name (non-Nullable first, then Nullable)
+    for nullable in [false, true] {
+        for col in &real {
+            if is_uint(&col.col_type) && is_nullable(&col.col_type) == nullable {
+                let lower = col.name.to_lowercase();
+                if preferred_uint.iter().any(|&p| lower == p) {
+                    return WatermarkKind::UInt64(col.name.clone());
+                }
             }
         }
     }
-    // 4. Any uint
-    for col in &real {
-        if is_uint(&col.col_type) {
-            return WatermarkKind::UInt64(col.name.clone());
+    // 4. Any uint (non-Nullable first, then Nullable)
+    for nullable in [false, true] {
+        for col in &real {
+            if is_uint(&col.col_type) && is_nullable(&col.col_type) == nullable {
+                return WatermarkKind::UInt64(col.name.clone());
+            }
         }
     }
     WatermarkKind::None
@@ -240,13 +404,30 @@ fn is_virtual(default_kind: &str) -> bool {
     matches!(default_kind, "MATERIALIZED" | "ALIAS" | "EPHEMERAL")
 }
 
-fn is_datetime(t: &str) -> bool {
-    let t = t.to_lowercase();
+/// Strip the `Nullable(...)` wrapper from a ClickHouse type string, returning the inner type.
+/// If the type is not Nullable, returns it unchanged.
+fn unwrap_nullable(type_name: &str) -> &str {
+    let t = type_name.trim();
+    if let Some(inner) = t.strip_prefix("Nullable(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            return inner;
+        }
+    }
+    t
+}
+
+/// Returns true if the column type is Nullable.
+fn is_nullable(type_name: &str) -> bool {
+    type_name.trim().to_lowercase().starts_with("nullable(")
+}
+
+fn is_datetime(type_name: &str) -> bool {
+    let t = unwrap_nullable(type_name).to_lowercase();
     t.starts_with("datetime") || t.starts_with("date32") || t.starts_with("date")
 }
 
-fn is_uint(t: &str) -> bool {
-    let t = t.to_lowercase();
+fn is_uint(type_name: &str) -> bool {
+    let t = unwrap_nullable(type_name).to_lowercase();
     t.starts_with("uint64") || t.starts_with("uint32") || t.starts_with("int64")
 }
 
@@ -321,6 +502,67 @@ mod tests {
         let out = adapt_ddl(ddl, "src", "t", "dst");
         let count = out.matches("IF NOT EXISTS").count();
         assert_eq!(count, 1, "expected exactly one IF NOT EXISTS, got: {}", out);
+    }
+
+    // -----------------------------------------------------------------------
+    // adapt_ddl — deprecated engine syntax rewriting
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn adapt_ddl_rewrites_replacing_mergetree() {
+        let ddl = "CREATE TABLE `src`.`t` (\n    `date` Date,\n    `version` String\n)\nENGINE = ReplacingMergeTree(date, version, 8192)";
+        let out = adapt_ddl(ddl, "src", "t", "dst");
+        assert!(out.contains("ENGINE = ReplacingMergeTree()"), "got: {}", out);
+        assert!(out.contains("ORDER BY version"), "got: {}", out);
+        assert!(out.contains("PARTITION BY toYYYYMM(date)"), "got: {}", out);
+        assert!(out.contains("SETTINGS index_granularity = 8192"), "got: {}", out);
+        assert!(!out.contains("ReplacingMergeTree(date,"), "should not have old args: {}", out);
+    }
+
+    #[test]
+    fn adapt_ddl_rewrites_mergetree_with_tuple_sort_key() {
+        let ddl = "CREATE TABLE `src`.`t` (x UInt64)\nENGINE = MergeTree(date, (col1, col2), 8192)";
+        let out = adapt_ddl(ddl, "src", "t", "dst");
+        assert!(out.contains("ENGINE = MergeTree()"), "got: {}", out);
+        assert!(out.contains("ORDER BY (col1, col2)"), "got: {}", out);
+        assert!(out.contains("PARTITION BY toYYYYMM(date)"), "got: {}", out);
+        assert!(out.contains("SETTINGS index_granularity = 8192"), "got: {}", out);
+    }
+
+    #[test]
+    fn adapt_ddl_rewrites_collapsing_mergetree() {
+        let ddl = "CREATE TABLE `src`.`t` (x UInt64)\nENGINE = CollapsingMergeTree(date, id, 8192, sign)";
+        let out = adapt_ddl(ddl, "src", "t", "dst");
+        assert!(out.contains("ENGINE = CollapsingMergeTree(sign)"), "got: {}", out);
+        assert!(out.contains("ORDER BY id"), "got: {}", out);
+        assert!(out.contains("PARTITION BY toYYYYMM(date)"), "got: {}", out);
+    }
+
+    #[test]
+    fn adapt_ddl_rewrites_replacing_mergetree_with_ver_col() {
+        let ddl = "CREATE TABLE `src`.`t` (x UInt64)\nENGINE = ReplacingMergeTree(date, id, 8192, ver)";
+        let out = adapt_ddl(ddl, "src", "t", "dst");
+        assert!(out.contains("ENGINE = ReplacingMergeTree(ver)"), "got: {}", out);
+        assert!(out.contains("ORDER BY id"), "got: {}", out);
+    }
+
+    #[test]
+    fn adapt_ddl_modern_syntax_untouched() {
+        let ddl = "CREATE TABLE `src`.`t` (x UInt64)\nENGINE = ReplacingMergeTree()\nORDER BY id\nSETTINGS index_granularity = 8192";
+        let out = adapt_ddl(ddl, "src", "t", "dst");
+        // Must remain unchanged (modulo db rename and IF NOT EXISTS)
+        assert!(out.contains("ENGINE = ReplacingMergeTree()"), "got: {}", out);
+        assert!(out.contains("ORDER BY id"), "got: {}", out);
+        // Should not have gained a duplicate ORDER BY
+        assert_eq!(out.matches("ORDER BY").count(), 1, "got: {}", out);
+    }
+
+    #[test]
+    fn adapt_ddl_empty_engine_args_untouched() {
+        let ddl = "CREATE TABLE `src`.`t` (x UInt64) ENGINE = MergeTree() ORDER BY x";
+        let out = adapt_ddl(ddl, "src", "t", "dst");
+        assert!(out.contains("ENGINE = MergeTree()"), "got: {}", out);
+        assert!(!out.contains("PARTITION BY"), "got: {}", out);
     }
 
     #[test]
@@ -515,6 +757,119 @@ mod tests {
         match pick_watermark(&cols) {
             WatermarkKind::DateTime(c) => assert_eq!(c, "real_ts"),
             other => panic!("expected real datetime, got: {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // unwrap_nullable / is_nullable
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unwrap_nullable_strips_wrapper() {
+        assert_eq!(unwrap_nullable("Nullable(DateTime)"), "DateTime");
+        assert_eq!(unwrap_nullable("Nullable(DateTime64(3))"), "DateTime64(3)");
+        assert_eq!(unwrap_nullable("Nullable(UInt64)"), "UInt64");
+    }
+
+    #[test]
+    fn unwrap_nullable_passthrough_non_nullable() {
+        assert_eq!(unwrap_nullable("DateTime"), "DateTime");
+        assert_eq!(unwrap_nullable("UInt64"), "UInt64");
+        assert_eq!(unwrap_nullable("String"), "String");
+    }
+
+    #[test]
+    fn is_nullable_detects_correctly() {
+        assert!(is_nullable("Nullable(DateTime)"));
+        assert!(is_nullable("Nullable(UInt64)"));
+        assert!(!is_nullable("DateTime"));
+        assert!(!is_nullable("UInt64"));
+    }
+
+    // -----------------------------------------------------------------------
+    // pick_watermark — Nullable types
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pick_watermark_nullable_datetime_recognized() {
+        let cols = vec![col("updated_at", "Nullable(DateTime)")];
+        match pick_watermark(&cols) {
+            WatermarkKind::DateTime(c) => assert_eq!(c, "updated_at"),
+            other => panic!("expected DateTime, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pick_watermark_nullable_datetime64_recognized() {
+        let cols = vec![col("event_time", "Nullable(DateTime64(3))")];
+        match pick_watermark(&cols) {
+            WatermarkKind::DateTime(c) => assert_eq!(c, "event_time"),
+            other => panic!("expected DateTime, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pick_watermark_nullable_uint_recognized() {
+        let cols = vec![col("version", "Nullable(UInt64)")];
+        match pick_watermark(&cols) {
+            WatermarkKind::UInt64(c) => assert_eq!(c, "version"),
+            other => panic!("expected UInt64, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pick_watermark_prefers_non_nullable_over_nullable_same_tier() {
+        // Both are preferred DateTime names; non-Nullable should win
+        let cols = vec![
+            col("updated_at", "Nullable(DateTime)"),
+            col("modified_at", "DateTime"),
+        ];
+        match pick_watermark(&cols) {
+            WatermarkKind::DateTime(c) => assert_eq!(c, "modified_at"),
+            other => panic!("expected non-nullable DateTime, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pick_watermark_nullable_preferred_beats_non_nullable_any() {
+        // Preferred-name Nullable should beat arbitrary non-Nullable (higher tier wins)
+        let cols = vec![
+            col("random_ts", "DateTime"),
+            col("updated_at", "Nullable(DateTime)"),
+        ];
+        match pick_watermark(&cols) {
+            WatermarkKind::DateTime(c) => assert_eq!(c, "updated_at"),
+            other => panic!("expected preferred Nullable, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pick_watermark_non_nullable_any_beats_nullable_any() {
+        let cols = vec![
+            col("some_ts", "Nullable(DateTime)"),
+            col("other_ts", "DateTime"),
+        ];
+        match pick_watermark(&cols) {
+            WatermarkKind::DateTime(c) => assert_eq!(c, "other_ts"),
+            other => panic!("expected non-nullable any DateTime, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pick_watermark_nullable_with_materialized_version_scenario() {
+        // The motivating bug: updated_at is Nullable(DateTime), _version is MATERIALIZED
+        // Both created_at and updated_at are preferred names; first match in column order wins.
+        let cols = vec![
+            col("id", "String"),
+            col("player_id", "Int32"),
+            col("created_at", "Nullable(DateTime)"),
+            col("updated_at", "Nullable(DateTime)"),
+            materialized_col("_sign", "Int8"),
+            materialized_col("_version", "UInt64"),
+        ];
+        match pick_watermark(&cols) {
+            WatermarkKind::DateTime(c) => assert_eq!(c, "created_at"),
+            other => panic!("expected Nullable DateTime watermark, got: {:?}", other),
         }
     }
 }
