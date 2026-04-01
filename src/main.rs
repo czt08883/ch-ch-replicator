@@ -56,6 +56,14 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    // Overwrite argv in /proc/self/cmdline to hide passwords from `ps aux`.
+    proctitle::set_title(format!(
+        "ch-ch-replicator --src={} --dest={} --threads={}",
+        sanitize_dsn(&cli.src),
+        sanitize_dsn(&cli.dest),
+        cli.threads,
+    ));
+
     if let Err(e) = run(cli).await {
         match e {
             ReplicatorError::Cancelled => {

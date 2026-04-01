@@ -1,6 +1,6 @@
 [package]
 name = "ch-ch-replicator"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2021"
 
 [[bin]]
@@ -22,3 +22,4 @@ url = "2"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["v4"] }
+proctitle = "0.1"
