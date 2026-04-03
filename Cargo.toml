@@ -1,6 +1,6 @@
 [package]
 name = "ch-ch-replicator"
-version = "0.2.9"
+version = "0.2.13"
 edition = "2021"
 
 [[bin]]

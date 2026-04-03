@@ -125,12 +125,13 @@ impl Config {
         src_dsn: &str,
         dest_dsn: &str,
         threads: usize,
+        batch_size: usize,
     ) -> Result<Self> {
         Ok(Self {
             source: ClickHouseConfig::from_dsn(src_dsn)?,
             destination: ClickHouseConfig::from_dsn(dest_dsn)?,
             threads,
-            batch_size: 50_000,
+            batch_size,
             cdc_poll_secs: 5,
             checkpoint_path: "checkpoint.json".to_string(),
         })
@@ -253,11 +254,12 @@ mod tests {
         let cfg = Config::new(
             "clickhouse://u:p@src:8123/src_db",
             "clickhouse://u:p@dst:8123/dst_db",
-            4,
+            3,
+            300_000,
         )
         .unwrap();
-        assert_eq!(cfg.threads, 4);
-        assert_eq!(cfg.batch_size, 50_000);
+        assert_eq!(cfg.threads, 3);
+        assert_eq!(cfg.batch_size, 300_000);
         assert_eq!(cfg.cdc_poll_secs, 5);
         assert_eq!(cfg.checkpoint_path, "checkpoint.json");
         assert_eq!(cfg.source.database, "src_db");
@@ -266,13 +268,13 @@ mod tests {
 
     #[test]
     fn test_config_bad_src_dsn_propagates_error() {
-        let err = Config::new("not-valid", "clickhouse://u:p@h:8123/db", 1).unwrap_err();
+        let err = Config::new("not-valid", "clickhouse://u:p@h:8123/db", 1, 300_000).unwrap_err();
         assert!(matches!(err, ReplicatorError::DsnParse(_)));
     }
 
     #[test]
     fn test_config_bad_dst_dsn_propagates_error() {
-        let err = Config::new("clickhouse://u:p@h:8123/db", "not-valid", 1).unwrap_err();
+        let err = Config::new("clickhouse://u:p@h:8123/db", "not-valid", 1, 300_000).unwrap_err();
         assert!(matches!(err, ReplicatorError::DsnParse(_)));
     }
 }

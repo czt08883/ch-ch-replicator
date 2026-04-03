@@ -16,7 +16,7 @@ use crate::checkpoint::Checkpoint;
 use crate::client::ClickHouseClient;
 use crate::config::Config;
 use crate::error::ReplicatorError;
-use crate::schema::{apply_ddl, ensure_database, get_create_ddl, list_tables};
+use crate::schema::{apply_ddl, ensure_database, get_create_ddl, list_dictionaries, list_tables};
 use crate::sync::InitialSync;
 
 use clap::Parser;
@@ -40,8 +40,12 @@ struct Cli {
     dest: String,
 
     /// Number of parallel worker threads for initial sync.
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "3")]
     threads: usize,
+
+    /// Batch size for SELECT/INSERT during initial sync.
+    #[arg(long, default_value = "300000")]
+    batch: usize,
 }
 
 #[tokio::main]
@@ -58,10 +62,11 @@ async fn main() {
 
     // Overwrite argv in /proc/self/cmdline to hide passwords from `ps aux`.
     proctitle::set_title(format!(
-        "ch-ch-replicator --src={} --dest={} --threads={}",
+        "ch-ch-replicator --src={} --dest={} --threads={} --batch={}",
         sanitize_dsn(&cli.src),
         sanitize_dsn(&cli.dest),
         cli.threads,
+        cli.batch,
     ));
 
     if let Err(e) = run(cli).await {
@@ -82,12 +87,13 @@ async fn run(cli: Cli) -> Result<(), ReplicatorError> {
     info!("  source:      {}", sanitize_dsn(&cli.src));
     info!("  destination: {}", sanitize_dsn(&cli.dest));
     info!("  threads:     {}", cli.threads);
+    info!("  batch:       {}", cli.batch);
 
     // Validate threads > 0
     let threads = if cli.threads == 0 { 1 } else { cli.threads };
 
     // Parse configuration
-    let config = Arc::new(Config::new(&cli.src, &cli.dest, threads)?);
+    let config = Arc::new(Config::new(&cli.src, &cli.dest, threads, cli.batch)?);
 
     // Build HTTP clients
     let src_client = Arc::new(ClickHouseClient::new(config.source.clone())?);
@@ -194,6 +200,16 @@ async fn setup_target_schema(
         info!("Ensuring DDL for table '{}' on target", table.name);
         let ddl = get_create_ddl(src, &table.name, &config.destination.database).await?;
         apply_ddl(dst, &ddl).await?;
+    }
+
+    let dictionaries = list_dictionaries(src).await?;
+    for dict in &dictionaries {
+        info!("Ensuring DDL for dictionary '{}' on target", dict);
+        let ddl = get_create_ddl(src, dict, &config.destination.database).await?;
+        apply_ddl(dst, &ddl).await?;
+    }
+    if !dictionaries.is_empty() {
+        info!("{} dictionary/dictionaries set up (data loaded from their own SOURCE)", dictionaries.len());
     }
 
     info!("Target schema setup complete");
