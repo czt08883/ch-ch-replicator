@@ -323,14 +323,12 @@ pub fn strip_excluded_columns(ddl: &str, excluded: &[String]) -> String {
 /// Returns `None` if the line doesn't look like a column definition.
 fn extract_col_name(line: &str) -> Option<&str> {
     let line = line.trim_start_matches(' ').trim_end_matches(',');
-    if line.starts_with('`') {
+    if let Some(rest) = line.strip_prefix('`') {
         // backtick-quoted: `name` Type ...
-        let rest = &line[1..];
         let end = rest.find('`')?;
         Some(&rest[..end])
-    } else if line.starts_with('"') {
+    } else if let Some(rest) = line.strip_prefix('"') {
         // double-quoted: "name" Type ...
-        let rest = &line[1..];
         let end = rest.find('"')?;
         Some(&rest[..end])
     } else {
