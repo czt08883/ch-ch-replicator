@@ -2,13 +2,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::checkpoint::Checkpoint;
 use crate::client::ClickHouseClient;
 use crate::config::Config;
 use crate::error::{ReplicatorError, Result};
-use crate::schema::{fetch_max_watermark, get_columns, pick_watermark, TableInfo, WatermarkKind};
+use crate::schema::{build_select_cols, fetch_max_watermark, get_columns, pick_watermark, TableInfo, WatermarkKind};
 
 /// CDC engine: polls each table for changes and replicates them to the target.
 pub struct CdcEngine {
@@ -48,7 +48,31 @@ impl CdcEngine {
         let mut table_states: Vec<TableState> = Vec::with_capacity(tables.len());
         for t in &tables {
             let cols = get_columns(&self.src, &t.name).await.unwrap_or_default();
-            let wm_kind = pick_watermark(&cols);
+            let excluded = self.config.excluded_columns_for(&t.name);
+
+            // Build explicit column list for SELECT (empty = SELECT *)
+            let col_list = if excluded.is_empty() {
+                String::new()
+            } else {
+                build_select_cols(&cols, excluded)
+            };
+
+            // Pick watermark; but if the watermark column is itself excluded → fall back to count-based
+            let wm_kind_raw = pick_watermark(&cols);
+            let wm_kind = match &wm_kind_raw {
+                WatermarkKind::DateTime(col) | WatermarkKind::UInt64(col)
+                    if excluded.contains(col) =>
+                {
+                    warn!(
+                        "Table '{}': watermark column '{}' is in --exclude-columns; \
+                         falling back to row-count CDC",
+                        t.name, col
+                    );
+                    WatermarkKind::None
+                }
+                other => other.clone(),
+            };
+            let _ = wm_kind_raw; // consumed above
 
             // Seed watermark: checkpoint wins; otherwise query MAX from source
             let (wm_col, wm_val) = {
@@ -104,6 +128,7 @@ impl CdcEngine {
                 wm_col,
                 wm_val,
                 sorting_key: t.sorting_key.clone(),
+                col_list,
             });
         }
 
@@ -175,7 +200,7 @@ impl CdcEngine {
         let limit = self.config.batch_size;
         let body = self
             .src
-            .select_delta_raw(&state.name, col, &wm_quoted, limit)
+            .select_delta_raw(&state.name, col, &wm_quoted, limit, &state.col_list)
             .await?;
 
         let line_count = count_jsonl_lines(&body);
@@ -222,7 +247,7 @@ impl CdcEngine {
         // Fetch exactly the new rows (LIMIT from the end of known range)
         let body = self
             .src
-            .select_batch_raw(&state.name, dst_count, diff as usize + 1, &state.sorting_key)
+            .select_batch_raw(&state.name, dst_count, diff as usize + 1, &state.sorting_key, &state.col_list)
             .await?;
 
         let line_count = count_jsonl_lines(&body);
@@ -257,6 +282,9 @@ struct TableState {
     wm_col: String,
     wm_val: String,
     sorting_key: String,
+    /// Explicit SELECT column list (backtick-quoted, comma-separated).
+    /// Empty string means `SELECT *`.
+    col_list: String,
 }
 
 /// Return the initial watermark placeholder value based on kind.

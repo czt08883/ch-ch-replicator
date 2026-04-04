@@ -174,15 +174,17 @@ impl ClickHouseClient {
 
     /// Query a batch of rows as raw JSONEachRow text (for bulk transfer).
     /// If `order_by` is non-empty, adds an ORDER BY clause for deterministic pagination.
-    pub async fn select_batch_raw(&self, table: &str, offset: u64, limit: usize, order_by: &str) -> Result<String> {
+    /// If `col_list` is non-empty, uses that as the SELECT list; otherwise uses `*`.
+    pub async fn select_batch_raw(&self, table: &str, offset: u64, limit: usize, order_by: &str, col_list: &str) -> Result<String> {
+        let select = if col_list.is_empty() { "*".to_string() } else { col_list.to_string() };
         let order_clause = if order_by.is_empty() {
             String::new()
         } else {
             format!(" ORDER BY {}", order_by)
         };
         let sql = format!(
-            "SELECT * FROM `{}`.`{}`{} LIMIT {} OFFSET {} FORMAT JSONEachRow",
-            self.config.database, table, order_clause, limit, offset
+            "SELECT {} FROM `{}`.`{}`{} LIMIT {} OFFSET {} FORMAT JSONEachRow",
+            select, self.config.database, table, order_clause, limit, offset
         );
         debug!("select_batch_raw: {}", sql);
 
@@ -208,16 +210,19 @@ impl ClickHouseClient {
     }
 
     /// Query rows WHERE a DateTime/UInt column is > watermark, returning raw JSONEachRow.
+    /// If `col_list` is non-empty, uses that as the SELECT list; otherwise uses `*`.
     pub async fn select_delta_raw(
         &self,
         table: &str,
         watermark_col: &str,
         watermark_val: &str,
         limit: usize,
+        col_list: &str,
     ) -> Result<String> {
+        let select = if col_list.is_empty() { "*".to_string() } else { col_list.to_string() };
         let sql = format!(
-            "SELECT * FROM `{}`.`{}` WHERE `{}` > {} ORDER BY `{}` ASC LIMIT {} FORMAT JSONEachRow",
-            self.config.database, table, watermark_col, watermark_val, watermark_col, limit
+            "SELECT {} FROM `{}`.`{}` WHERE `{}` > {} ORDER BY `{}` ASC LIMIT {} FORMAT JSONEachRow",
+            select, self.config.database, table, watermark_col, watermark_val, watermark_col, limit
         );
         debug!("select_delta_raw: {}", sql);
 

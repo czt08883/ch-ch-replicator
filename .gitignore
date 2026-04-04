@@ -3,7 +3,6 @@ checkpoint.json
 checkpoint.json.tmp
 .bg-shell/
 
-# ── GSD baseline (auto-generated) ──
 .gsd
 .gsd-id
 .DS_Store

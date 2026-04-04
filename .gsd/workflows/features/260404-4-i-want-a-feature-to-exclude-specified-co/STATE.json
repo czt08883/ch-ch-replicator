@@ -1,0 +1,32 @@
+{
+  "template": "small-feature",
+  "templateName": "Small Feature",
+  "description": "I want a feature to exclude specified columns from target (schema creation, initial sync, and cdc). These columns should be specified as \"--exclude-colmns=table1.column1,table2.column2\" in cli args",
+  "branch": "gsd/small-feature/i-want-a-feature-to-exclude-specified-co",
+  "phases": [
+    {
+      "name": "scope",
+      "index": 0,
+      "status": "active"
+    },
+    {
+      "name": "plan",
+      "index": 1,
+      "status": "pending"
+    },
+    {
+      "name": "implement",
+      "index": 2,
+      "status": "pending"
+    },
+    {
+      "name": "verify",
+      "index": 3,
+      "status": "pending"
+    }
+  ],
+  "currentPhase": 0,
+  "startedAt": "2026-04-04T15:21:03.764Z",
+  "updatedAt": "2026-04-04T15:21:03.764Z",
+  "artifactDir": "/home/czt08883/work/ch-ch-replicator/.gsd/workflows/features/260404-4-i-want-a-feature-to-exclude-specified-co"
+}

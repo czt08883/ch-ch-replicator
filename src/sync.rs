@@ -10,7 +10,7 @@ use crate::checkpoint::Checkpoint;
 use crate::client::ClickHouseClient;
 use crate::config::Config;
 use crate::error::{ReplicatorError, Result};
-use crate::schema::TableInfo;
+use crate::schema::{build_select_cols, get_columns, TableInfo};
 
 const MAX_RETRIES: u32 = 10;
 const RETRY_DELAY: Duration = Duration::from_secs(10);
@@ -121,6 +121,20 @@ impl InitialSync {
         let batch_size = self.config.batch_size;
         let threads = self.config.threads;
 
+        // Build explicit column list (respects --exclude-columns)
+        let excluded = self.config.excluded_columns_for(&table.name);
+        let col_list = if excluded.is_empty() {
+            String::new() // use SELECT * — no exclusions
+        } else {
+            let cols = get_columns(&self.src, &table.name).await.unwrap_or_default();
+            let list = build_select_cols(&cols, excluded);
+            info!(
+                "Table '{}': selecting columns: {}",
+                table.name, list
+            );
+            list
+        };
+
         // Shared state across workers
         let next_offset = Arc::new(AtomicU64::new(start_offset));
         let tracker = Arc::new(Mutex::new(BatchTracker::new(start_offset, batch_size as u64)));
@@ -138,6 +152,7 @@ impl InitialSync {
             let config = self.config.clone();
             let table_name = table.name.clone();
             let sorting_key = table.sorting_key.clone();
+            let col_list = col_list.clone();
 
             handles.push(tokio::spawn(async move {
                 loop {
@@ -158,7 +173,7 @@ impl InitialSync {
                         }
                         match async {
                             let body = src
-                                .select_batch_raw(&table_name, offset, batch_size, &sorting_key)
+                                .select_batch_raw(&table_name, offset, batch_size, &sorting_key, &col_list)
                                 .await?;
                             let lines = count_jsonl_lines(&body);
                             if lines > 0 {

@@ -25,7 +25,7 @@ pub struct ColumnInfo {
 }
 
 /// The kind of column usable as a CDC watermark.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WatermarkKind {
     DateTime(String),   // column name
     UInt64(String),     // column name (e.g. version, id)
@@ -233,6 +233,111 @@ fn build_engine_inner(engine: &str, extra: &[&str]) -> String {
     }
 }
 
+/// Remove excluded column definitions from a `CREATE TABLE` DDL string.
+///
+/// ClickHouse `SHOW CREATE TABLE` produces one column definition per line inside
+/// the `(...)` block.  Each line looks like:
+///   `    \`col_name\` Type [modifiers][,]`
+///
+/// The function:
+/// 1. Removes any line whose column name (backtick-quoted or bare) matches an entry in `excluded`.
+/// 2. Ensures the remaining column list has correct comma placement (the last column has no
+///    trailing comma; all others do).
+///
+/// Lines outside the column block (ENGINE, ORDER BY, …) are never modified.
+pub fn strip_excluded_columns(ddl: &str, excluded: &[String]) -> String {
+    if excluded.is_empty() {
+        return ddl.to_string();
+    }
+
+    let lines: Vec<&str> = ddl.lines().collect();
+    let mut in_columns = false;
+    let mut col_lines: Vec<String> = Vec::new();   // column definition lines to keep
+    let mut before: Vec<&str> = Vec::new();        // lines before the column block
+    let mut after: Vec<&str> = Vec::new();         // lines from ENGINE onwards
+
+    let mut removed_any = false;
+
+    for line in &lines {
+        let trimmed = line.trim();
+        if !in_columns {
+            // The column block starts on the line that is just "(" (or the opening
+            // paren of CREATE TABLE ... (\n).
+            if trimmed == "(" {
+                in_columns = true;
+                before.push(line);
+                continue;
+            }
+            before.push(line);
+        } else {
+            // The column block ends when we hit a line that starts ENGINE or ")" alone.
+            // In modern ClickHouse DDL the closing ")" is on its own line before ENGINE.
+            if trimmed == ")" || trimmed.starts_with(')') {
+                in_columns = false;
+                after.push(line);
+                continue;
+            }
+            // Check if this line defines one of the excluded columns
+            if let Some(col_name) = extract_col_name(trimmed) {
+                if excluded.iter().any(|ex| ex == col_name) {
+                    // Skip this column line
+                    removed_any = true;
+                    continue;
+                }
+            }
+            // Strip trailing comma, we'll add them back correctly below
+            let stripped = trimmed.trim_end_matches(',').to_string();
+            col_lines.push(stripped);
+        }
+    }
+
+    // If nothing was removed (or the column block wasn't found), return unchanged
+    if !removed_any || col_lines.is_empty() {
+        return ddl.to_string();
+    }
+
+    // Re-add commas: every line except the last gets a comma
+    let last = col_lines.len() - 1;
+    let formatted_cols: Vec<String> = col_lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let indent = "    ";
+            if i < last {
+                format!("{}{},", indent, l)
+            } else {
+                format!("{}{}", indent, l)
+            }
+        })
+        .collect();
+
+    let mut result = Vec::new();
+    result.extend(before.iter().map(|s| s.to_string()));
+    result.extend(formatted_cols);
+    result.extend(after.iter().map(|s| s.to_string()));
+    result.join("\n")
+}
+
+/// Extract the column name from a DDL column definition line.
+/// Handles both backtick-quoted (`` `col` ``) and bare (`col`) names.
+/// Returns `None` if the line doesn't look like a column definition.
+fn extract_col_name(line: &str) -> Option<&str> {
+    let line = line.trim_start_matches(' ').trim_end_matches(',');
+    if let Some(rest) = line.strip_prefix('`') {
+        // backtick-quoted: `name` Type ...
+        let end = rest.find('`')?;
+        Some(&rest[..end])
+    } else if let Some(rest) = line.strip_prefix('"') {
+        // double-quoted: "name" Type ...
+        let end = rest.find('"')?;
+        Some(&rest[..end])
+    } else {
+        // bare: name Type ...
+        let end = line.find(char::is_whitespace)?;
+        Some(&line[..end])
+    }
+}
+
 /// Returns the CREATE TABLE DDL for a given table, adapted for use on the target.
 ///
 /// Steps:
@@ -243,6 +348,7 @@ pub async fn get_create_ddl(
     client: &ClickHouseClient,
     table: &str,
     dest_database: &str,
+    excluded_cols: &[String],
 ) -> Result<String> {
     let sql = format!(
         "SHOW CREATE TABLE `{}`.`{}`",
@@ -266,7 +372,8 @@ pub async fn get_create_ddl(
         })?
         .to_string();
 
-    Ok(adapt_ddl(&ddl, &client.config.database, table, dest_database))
+    let adapted = adapt_ddl(&ddl, &client.config.database, table, dest_database);
+    Ok(strip_excluded_columns(&adapted, excluded_cols))
 }
 
 /// Ensure the target database exists.
@@ -280,6 +387,25 @@ pub async fn ensure_database(client: &ClickHouseClient, database: &str) -> Resul
 pub async fn apply_ddl(client: &ClickHouseClient, ddl: &str) -> Result<()> {
     info!("Applying DDL: {:.120}…", ddl);
     client.execute_no_db(ddl).await
+}
+
+/// Build an explicit SELECT column list for a table, excluding virtual and user-excluded columns.
+///
+/// Returns a comma-separated, backtick-quoted list of column names, e.g.:
+///   `` `id`, `name`, `ts` ``
+///
+/// If the resulting list would be empty (all columns excluded), returns `"*"` as a safe fallback.
+pub fn build_select_cols(columns: &[ColumnInfo], excluded: &[String]) -> String {
+    let cols: Vec<String> = columns
+        .iter()
+        .filter(|c| !is_virtual(&c.default_kind) && !excluded.contains(&c.name))
+        .map(|c| format!("`{}`", c.name))
+        .collect();
+    if cols.is_empty() {
+        "*".to_string()
+    } else {
+        cols.join(", ")
+    }
 }
 
 /// Fetch the current MAX value of a watermark column from the source table.
@@ -910,5 +1036,135 @@ mod tests {
             WatermarkKind::DateTime(c) => assert_eq!(c, "created_at"),
             other => panic!("expected Nullable DateTime watermark, got: {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_excluded_columns
+    // -----------------------------------------------------------------------
+
+    fn sample_ddl() -> &'static str {
+        "CREATE TABLE IF NOT EXISTS `dst`.`orders`\n(\n    `id` UInt64,\n    `secret` String,\n    `name` String\n)\nENGINE = MergeTree()\nORDER BY id"
+    }
+
+    #[test]
+    fn strip_excluded_no_op_when_empty_list() {
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &[]);
+        assert_eq!(result, ddl);
+    }
+
+    #[test]
+    fn strip_excluded_removes_backtick_column() {
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &["secret".to_string()]);
+        assert!(!result.contains("`secret`"), "column should be gone: {}", result);
+        assert!(result.contains("`id`"), "id should remain: {}", result);
+        assert!(result.contains("`name`"), "name should remain: {}", result);
+    }
+
+    #[test]
+    fn strip_excluded_commas_correct_after_removal() {
+        // After removing `secret`, the last remaining column must have no trailing comma
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &["secret".to_string()]);
+        // `name` is now last — must not end with a comma
+        for line in result.lines() {
+            if line.trim_start().starts_with("`name`") {
+                assert!(!line.trim_end().ends_with(','), "last column must not have trailing comma: {}", line);
+            }
+        }
+        // `id` is not last — must end with a comma
+        for line in result.lines() {
+            if line.trim_start().starts_with("`id`") {
+                assert!(line.trim_end().ends_with(','), "non-last column must have trailing comma: {}", line);
+            }
+        }
+    }
+
+    #[test]
+    fn strip_excluded_removes_first_column() {
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &["id".to_string()]);
+        assert!(!result.contains("`id`"), "id should be removed: {}", result);
+        assert!(result.contains("`secret`"), "secret should remain: {}", result);
+        assert!(result.contains("`name`"), "name should remain: {}", result);
+    }
+
+    #[test]
+    fn strip_excluded_removes_last_column() {
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &["name".to_string()]);
+        assert!(!result.contains("`name`"), "name should be removed: {}", result);
+        // secret is now last — no trailing comma
+        for line in result.lines() {
+            if line.trim_start().starts_with("`secret`") {
+                assert!(!line.trim_end().ends_with(','), "last column should have no comma: {}", line);
+            }
+        }
+    }
+
+    #[test]
+    fn strip_excluded_unknown_column_leaves_ddl_unchanged() {
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &["nonexistent".to_string()]);
+        assert_eq!(result, ddl);
+    }
+
+    #[test]
+    fn strip_excluded_engine_section_untouched() {
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &["secret".to_string()]);
+        assert!(result.contains("ENGINE = MergeTree()"), "engine section lost: {}", result);
+        assert!(result.contains("ORDER BY id"), "order by lost: {}", result);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_select_cols
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_select_cols_no_exclusions_returns_all_real() {
+        let cols = vec![
+            col("id", "UInt64"),
+            col("name", "String"),
+            materialized_col("_version", "UInt64"),
+        ];
+        let result = build_select_cols(&cols, &[]);
+        assert_eq!(result, "`id`, `name`");
+    }
+
+    #[test]
+    fn build_select_cols_excludes_named_column() {
+        let cols = vec![
+            col("id", "UInt64"),
+            col("secret", "String"),
+            col("name", "String"),
+        ];
+        let result = build_select_cols(&cols, &["secret".to_string()]);
+        assert_eq!(result, "`id`, `name`");
+    }
+
+    #[test]
+    fn build_select_cols_excludes_virtual_columns_always() {
+        let cols = vec![
+            col("id", "UInt64"),
+            materialized_col("computed", "UInt64"),
+            ColumnInfo { name: "alias_col".to_string(), col_type: "String".to_string(), default_kind: "ALIAS".to_string() },
+        ];
+        let result = build_select_cols(&cols, &[]);
+        assert_eq!(result, "`id`");
+    }
+
+    #[test]
+    fn build_select_cols_all_excluded_returns_star() {
+        let cols = vec![col("id", "UInt64")];
+        let result = build_select_cols(&cols, &["id".to_string()]);
+        assert_eq!(result, "*");
+    }
+
+    #[test]
+    fn build_select_cols_empty_column_list_returns_star() {
+        let result = build_select_cols(&[], &[]);
+        assert_eq!(result, "*");
     }
 }
