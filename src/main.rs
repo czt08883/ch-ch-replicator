@@ -308,3 +308,88 @@ fn sanitize_dsn(dsn: &str) -> String {
         "<invalid DSN>".to_string()
     }
 }
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use crate::schema::TableInfo;
+
+    fn make_tables(names: &[&str]) -> Vec<TableInfo> {
+        names.iter().map(|n| TableInfo {
+            name: n.to_string(),
+            engine: "MergeTree".to_string(),
+            sorting_key: String::new(),
+        }).collect()
+    }
+
+    fn names(tables: &[TableInfo]) -> Vec<&str> {
+        tables.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    #[test]
+    fn no_filters_returns_all() {
+        let tables = make_tables(&["a", "b", "c"]);
+        let result = filter_tables(tables, &[], &[]);
+        assert_eq!(names(&result), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn include_keeps_only_listed() {
+        let tables = make_tables(&["a", "b", "c"]);
+        let include = vec!["a".to_string(), "c".to_string()];
+        let result = filter_tables(tables, &include, &[]);
+        assert_eq!(names(&result), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn exclude_removes_listed() {
+        let tables = make_tables(&["a", "b", "c"]);
+        let exclude = vec!["b".to_string()];
+        let result = filter_tables(tables, &[], &exclude);
+        assert_eq!(names(&result), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn include_then_exclude_applied_in_order() {
+        // Include a,b,c then exclude b → result: a, c
+        let tables = make_tables(&["a", "b", "c", "d"]);
+        let include = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let exclude = vec!["b".to_string()];
+        let result = filter_tables(tables, &include, &exclude);
+        assert_eq!(names(&result), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn include_unknown_name_yields_empty() {
+        let tables = make_tables(&["a", "b"]);
+        let include = vec!["nonexistent".to_string()];
+        let result = filter_tables(tables, &include, &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn include_and_exclude_same_table_exclude_wins() {
+        // Include a,b and also exclude a → only b remains
+        let tables = make_tables(&["a", "b", "c"]);
+        let include = vec!["a".to_string(), "b".to_string()];
+        let exclude = vec!["a".to_string()];
+        let result = filter_tables(tables, &include, &exclude);
+        assert_eq!(names(&result), vec!["b"]);
+    }
+
+    #[test]
+    fn matching_is_case_sensitive() {
+        let tables = make_tables(&["Events", "events"]);
+        let include = vec!["events".to_string()];
+        let result = filter_tables(tables, &include, &[]);
+        assert_eq!(names(&result), vec!["events"]);
+    }
+
+    #[test]
+    fn exclude_all_yields_empty() {
+        let tables = make_tables(&["a", "b"]);
+        let exclude = vec!["a".to_string(), "b".to_string()];
+        let result = filter_tables(tables, &[], &exclude);
+        assert!(result.is_empty());
+    }
+}
