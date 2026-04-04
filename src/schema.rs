@@ -233,6 +233,110 @@ fn build_engine_inner(engine: &str, extra: &[&str]) -> String {
     }
 }
 
+/// Remove excluded column definitions from a `CREATE TABLE` DDL string.
+///
+/// ClickHouse `SHOW CREATE TABLE` produces one column definition per line inside
+/// the `(...)` block.  Each line looks like:
+///   `    \`col_name\` Type [modifiers][,]`
+///
+/// The function:
+/// 1. Removes any line whose column name (backtick-quoted or bare) matches an entry in `excluded`.
+/// 2. Ensures the remaining column list has correct comma placement (the last column has no
+///    trailing comma; all others do).
+///
+/// Lines outside the column block (ENGINE, ORDER BY, …) are never modified.
+pub fn strip_excluded_columns(ddl: &str, excluded: &[String]) -> String {
+    if excluded.is_empty() {
+        return ddl.to_string();
+    }
+
+    let lines: Vec<&str> = ddl.lines().collect();
+    let mut in_columns = false;
+    let mut col_lines: Vec<String> = Vec::new();   // column definition lines to keep
+    let mut before: Vec<&str> = Vec::new();        // lines before the column block
+    let mut after: Vec<&str> = Vec::new();         // lines from ENGINE onwards
+
+    for line in &lines {
+        let trimmed = line.trim();
+        if !in_columns {
+            // The column block starts on the line that is just "(" (or the opening
+            // paren of CREATE TABLE ... (\n).
+            if trimmed == "(" {
+                in_columns = true;
+                before.push(line);
+                continue;
+            }
+            before.push(line);
+        } else {
+            // The column block ends when we hit a line that starts ENGINE or ")" alone.
+            // In modern ClickHouse DDL the closing ")" is on its own line before ENGINE.
+            if trimmed == ")" || trimmed.starts_with(')') {
+                in_columns = false;
+                after.push(line);
+                continue;
+            }
+            // Check if this line defines one of the excluded columns
+            if let Some(col_name) = extract_col_name(trimmed) {
+                if excluded.iter().any(|ex| ex == col_name) {
+                    // Skip this column line
+                    continue;
+                }
+            }
+            // Strip trailing comma, we'll add them back correctly below
+            let stripped = trimmed.trim_end_matches(',').to_string();
+            col_lines.push(stripped);
+        }
+    }
+
+    if col_lines.is_empty() {
+        // Nothing was in the column block (DDL format not recognised) — return unchanged
+        return ddl.to_string();
+    }
+
+    // Re-add commas: every line except the last gets a comma
+    let last = col_lines.len() - 1;
+    let formatted_cols: Vec<String> = col_lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let indent = "    ";
+            if i < last {
+                format!("{}{},", indent, l)
+            } else {
+                format!("{}{}", indent, l)
+            }
+        })
+        .collect();
+
+    let mut result = Vec::new();
+    result.extend(before.iter().map(|s| s.to_string()));
+    result.extend(formatted_cols);
+    result.extend(after.iter().map(|s| s.to_string()));
+    result.join("\n")
+}
+
+/// Extract the column name from a DDL column definition line.
+/// Handles both backtick-quoted (`` `col` ``) and bare (`col`) names.
+/// Returns `None` if the line doesn't look like a column definition.
+fn extract_col_name(line: &str) -> Option<&str> {
+    let line = line.trim_start_matches(' ').trim_end_matches(',');
+    if line.starts_with('`') {
+        // backtick-quoted: `name` Type ...
+        let rest = &line[1..];
+        let end = rest.find('`')?;
+        Some(&rest[..end])
+    } else if line.starts_with('"') {
+        // double-quoted: "name" Type ...
+        let rest = &line[1..];
+        let end = rest.find('"')?;
+        Some(&rest[..end])
+    } else {
+        // bare: name Type ...
+        let end = line.find(char::is_whitespace)?;
+        Some(&line[..end])
+    }
+}
+
 /// Returns the CREATE TABLE DDL for a given table, adapted for use on the target.
 ///
 /// Steps:
@@ -243,6 +347,7 @@ pub async fn get_create_ddl(
     client: &ClickHouseClient,
     table: &str,
     dest_database: &str,
+    excluded_cols: &[String],
 ) -> Result<String> {
     let sql = format!(
         "SHOW CREATE TABLE `{}`.`{}`",
@@ -266,7 +371,8 @@ pub async fn get_create_ddl(
         })?
         .to_string();
 
-    Ok(adapt_ddl(&ddl, &client.config.database, table, dest_database))
+    let adapted = adapt_ddl(&ddl, &client.config.database, table, dest_database);
+    Ok(strip_excluded_columns(&adapted, excluded_cols))
 }
 
 /// Ensure the target database exists.

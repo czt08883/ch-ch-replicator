@@ -239,14 +239,15 @@ async fn setup_target_schema(
 
     for table in tables {
         info!("Ensuring DDL for table '{}' on target", table.name);
-        let ddl = get_create_ddl(src, &table.name, &config.destination.database).await?;
+        let excluded = config.excluded_columns_for(&table.name);
+        let ddl = get_create_ddl(src, &table.name, &config.destination.database, excluded).await?;
         apply_ddl(dst, &ddl).await?;
     }
 
     let dictionaries = list_dictionaries(src).await?;
     for dict in &dictionaries {
         info!("Ensuring DDL for dictionary '{}' on target", dict);
-        let ddl = get_create_ddl(src, dict, &config.destination.database).await?;
+        let ddl = get_create_ddl(src, dict, &config.destination.database, &[]).await?;
         apply_ddl(dst, &ddl).await?;
     }
     if !dictionaries.is_empty() {
