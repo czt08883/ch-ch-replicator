@@ -50,7 +50,7 @@ fn mask_password(s: &str) -> String {
     };
     let value_start = start + marker.len();
     let value_end = s[value_start..]
-        .find(|c: char| c == '&' || c == ')' || c == ' ')
+        .find(['&', ')', ' '])
         .map(|i| value_start + i)
         .unwrap_or(s.len());
     format!("{}{}***{}", &s[..value_start], "", &s[value_end..])
