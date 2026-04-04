@@ -24,4 +24,6 @@ RUN apt-get update \
 
 COPY --from=builder /build/target/release/ch-ch-replicator /usr/local/bin/ch-ch-replicator
 
+WORKDIR /data
+
 ENTRYPOINT ["/usr/local/bin/ch-ch-replicator"]

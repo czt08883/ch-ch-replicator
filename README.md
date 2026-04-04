@@ -49,19 +49,18 @@ Logging verbosity is controlled via the `RUST_LOG` environment variable (e.g. `R
 ```bash
 docker run --rm \
   -v /path/to/data:/data \
-  czt08883/ch-ch-replicator:0.2.14 \
+  czt08883/ch-ch-replicator:0.2.15 \
   --src="clickhouse://user:password@source-host:8123/mydb" \
   --dest="clickhouse://user:password@dest-host:8123/mydb" \
   --threads=4
 ```
 
-The container writes `checkpoint.json` to its **current working directory** (`/`). Mount a host directory to preserve the checkpoint across container restarts:
+The container writes `checkpoint.json` to its working directory (`/data`). Mount a host directory to preserve the checkpoint across container restarts:
 
 ```bash
 docker run --rm \
   -v /path/to/data:/data \
-  -w /data \
-  czt08883/ch-ch-replicator:0.2.14 \
+  czt08883/ch-ch-replicator:0.2.15 \
   --src="clickhouse://user:password@source-host:8123/mydb" \
   --dest="clickhouse://user:password@dest-host:8123/mydb"
 ```
@@ -71,8 +70,7 @@ With Docker Compose:
 ```yaml
 services:
   replicator:
-    image: czt08883/ch-ch-replicator:0.2.14
-    working_dir: /data
+    image: czt08883/ch-ch-replicator:0.2.15
     volumes:
       - ./replicator-data:/data
     command:
@@ -127,5 +125,5 @@ Requires Rust 1.70+. No C dependencies — TLS is handled by rustls.
 ## Building the Docker image
 
 ```bash
-docker build -t czt08883/ch-ch-replicator:0.2.14 .
+docker build -t czt08883/ch-ch-replicator:0.2.15 .
 ```
