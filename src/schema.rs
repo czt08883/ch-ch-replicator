@@ -25,7 +25,7 @@ pub struct ColumnInfo {
 }
 
 /// The kind of column usable as a CDC watermark.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WatermarkKind {
     DateTime(String),   // column name
     UInt64(String),     // column name (e.g. version, id)
