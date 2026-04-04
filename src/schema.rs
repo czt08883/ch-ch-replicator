@@ -256,6 +256,8 @@ pub fn strip_excluded_columns(ddl: &str, excluded: &[String]) -> String {
     let mut before: Vec<&str> = Vec::new();        // lines before the column block
     let mut after: Vec<&str> = Vec::new();         // lines from ENGINE onwards
 
+    let mut removed_any = false;
+
     for line in &lines {
         let trimmed = line.trim();
         if !in_columns {
@@ -279,6 +281,7 @@ pub fn strip_excluded_columns(ddl: &str, excluded: &[String]) -> String {
             if let Some(col_name) = extract_col_name(trimmed) {
                 if excluded.iter().any(|ex| ex == col_name) {
                     // Skip this column line
+                    removed_any = true;
                     continue;
                 }
             }
@@ -288,8 +291,8 @@ pub fn strip_excluded_columns(ddl: &str, excluded: &[String]) -> String {
         }
     }
 
-    if col_lines.is_empty() {
-        // Nothing was in the column block (DDL format not recognised) — return unchanged
+    // If nothing was removed (or the column block wasn't found), return unchanged
+    if !removed_any || col_lines.is_empty() {
         return ddl.to_string();
     }
 
@@ -1035,5 +1038,135 @@ mod tests {
             WatermarkKind::DateTime(c) => assert_eq!(c, "created_at"),
             other => panic!("expected Nullable DateTime watermark, got: {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_excluded_columns
+    // -----------------------------------------------------------------------
+
+    fn sample_ddl() -> &'static str {
+        "CREATE TABLE IF NOT EXISTS `dst`.`orders`\n(\n    `id` UInt64,\n    `secret` String,\n    `name` String\n)\nENGINE = MergeTree()\nORDER BY id"
+    }
+
+    #[test]
+    fn strip_excluded_no_op_when_empty_list() {
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &[]);
+        assert_eq!(result, ddl);
+    }
+
+    #[test]
+    fn strip_excluded_removes_backtick_column() {
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &["secret".to_string()]);
+        assert!(!result.contains("`secret`"), "column should be gone: {}", result);
+        assert!(result.contains("`id`"), "id should remain: {}", result);
+        assert!(result.contains("`name`"), "name should remain: {}", result);
+    }
+
+    #[test]
+    fn strip_excluded_commas_correct_after_removal() {
+        // After removing `secret`, the last remaining column must have no trailing comma
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &["secret".to_string()]);
+        // `name` is now last — must not end with a comma
+        for line in result.lines() {
+            if line.trim_start().starts_with("`name`") {
+                assert!(!line.trim_end().ends_with(','), "last column must not have trailing comma: {}", line);
+            }
+        }
+        // `id` is not last — must end with a comma
+        for line in result.lines() {
+            if line.trim_start().starts_with("`id`") {
+                assert!(line.trim_end().ends_with(','), "non-last column must have trailing comma: {}", line);
+            }
+        }
+    }
+
+    #[test]
+    fn strip_excluded_removes_first_column() {
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &["id".to_string()]);
+        assert!(!result.contains("`id`"), "id should be removed: {}", result);
+        assert!(result.contains("`secret`"), "secret should remain: {}", result);
+        assert!(result.contains("`name`"), "name should remain: {}", result);
+    }
+
+    #[test]
+    fn strip_excluded_removes_last_column() {
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &["name".to_string()]);
+        assert!(!result.contains("`name`"), "name should be removed: {}", result);
+        // secret is now last — no trailing comma
+        for line in result.lines() {
+            if line.trim_start().starts_with("`secret`") {
+                assert!(!line.trim_end().ends_with(','), "last column should have no comma: {}", line);
+            }
+        }
+    }
+
+    #[test]
+    fn strip_excluded_unknown_column_leaves_ddl_unchanged() {
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &["nonexistent".to_string()]);
+        assert_eq!(result, ddl);
+    }
+
+    #[test]
+    fn strip_excluded_engine_section_untouched() {
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &["secret".to_string()]);
+        assert!(result.contains("ENGINE = MergeTree()"), "engine section lost: {}", result);
+        assert!(result.contains("ORDER BY id"), "order by lost: {}", result);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_select_cols
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_select_cols_no_exclusions_returns_all_real() {
+        let cols = vec![
+            col("id", "UInt64"),
+            col("name", "String"),
+            materialized_col("_version", "UInt64"),
+        ];
+        let result = build_select_cols(&cols, &[]);
+        assert_eq!(result, "`id`, `name`");
+    }
+
+    #[test]
+    fn build_select_cols_excludes_named_column() {
+        let cols = vec![
+            col("id", "UInt64"),
+            col("secret", "String"),
+            col("name", "String"),
+        ];
+        let result = build_select_cols(&cols, &["secret".to_string()]);
+        assert_eq!(result, "`id`, `name`");
+    }
+
+    #[test]
+    fn build_select_cols_excludes_virtual_columns_always() {
+        let cols = vec![
+            col("id", "UInt64"),
+            materialized_col("computed", "UInt64"),
+            ColumnInfo { name: "alias_col".to_string(), col_type: "String".to_string(), default_kind: "ALIAS".to_string() },
+        ];
+        let result = build_select_cols(&cols, &[]);
+        assert_eq!(result, "`id`");
+    }
+
+    #[test]
+    fn build_select_cols_all_excluded_returns_star() {
+        let cols = vec![col("id", "UInt64")];
+        let result = build_select_cols(&cols, &["id".to_string()]);
+        assert_eq!(result, "*");
+    }
+
+    #[test]
+    fn build_select_cols_empty_column_list_returns_star() {
+        let result = build_select_cols(&[], &[]);
+        assert_eq!(result, "*");
     }
 }

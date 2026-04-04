@@ -430,3 +430,52 @@ mod filter_tests {
         assert!(result.is_empty());
     }
 }
+
+#[cfg(test)]
+mod parse_exclude_cols_tests {
+    use super::*;
+
+    #[test]
+    fn valid_pairs_build_correct_map() {
+        let entries = vec![
+            "orders.secret".to_string(),
+            "users.password".to_string(),
+            "orders.internal_id".to_string(),
+        ];
+        let map = parse_exclude_columns(entries);
+        let mut orders = map.get("orders").cloned().unwrap_or_default();
+        orders.sort();
+        assert_eq!(orders, vec!["internal_id", "secret"]);
+        assert_eq!(map.get("users").cloned().unwrap_or_default(), vec!["password"]);
+    }
+
+    #[test]
+    fn entry_without_dot_is_skipped() {
+        let entries = vec!["nodot".to_string(), "orders.col".to_string()];
+        let map = parse_exclude_columns(entries);
+        assert!(!map.contains_key("nodot"));
+        assert!(map.contains_key("orders"));
+    }
+
+    #[test]
+    fn empty_input_yields_empty_map() {
+        let map = parse_exclude_columns(vec![]);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn malformed_dot_only_is_skipped() {
+        // ".col" has empty table name
+        let entries = vec![".col".to_string()];
+        let map = parse_exclude_columns(entries);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn table_dot_only_is_skipped() {
+        // "table." has empty column name
+        let entries = vec!["table.".to_string()];
+        let map = parse_exclude_columns(entries);
+        assert!(map.is_empty());
+    }
+}
