@@ -142,13 +142,21 @@ async fn run(cli: Cli) -> Result<(), ReplicatorError> {
 
     // Phase 2: Schema discovery
     info!("Discovering tables in source database '{}'…", config.source.database);
-    let tables = list_tables(&src_client).await?;
+    let all_tables = list_tables(&src_client).await?;
 
-    if tables.is_empty() {
+    if all_tables.is_empty() {
         warn!("No tables found in source database '{}' — nothing to replicate", config.source.database);
         return Ok(());
     }
-    info!("Found {} table(s) to replicate", tables.len());
+
+    // Apply --include / --exclude filters
+    let tables = filter_tables(all_tables, &config.include_tables, &config.exclude_tables);
+
+    if tables.is_empty() {
+        warn!("All tables were filtered out — nothing to replicate");
+        return Ok(());
+    }
+    info!("Replicating {} table(s)", tables.len());
     for t in &tables {
         info!("  - {} ({})", t.name, t.engine);
     }
@@ -257,6 +265,37 @@ async fn wait_for_shutdown_signal() {
         tokio::signal::ctrl_c().await.ok();
         info!("Received Ctrl-C");
     }
+}
+
+/// Filter a list of tables according to include/exclude lists.
+///
+/// Algorithm:
+/// 1. If `include` is non-empty, keep only tables whose name is in the list.
+/// 2. Remove any table whose name is in `exclude`.
+///
+/// Both lists use exact, case-sensitive matching.
+fn filter_tables(
+    tables: Vec<crate::schema::TableInfo>,
+    include: &[String],
+    exclude: &[String],
+) -> Vec<crate::schema::TableInfo> {
+    let filtered: Vec<crate::schema::TableInfo> = tables
+        .into_iter()
+        .filter(|t| {
+            // Step 1: include filter
+            if !include.is_empty() && !include.contains(&t.name) {
+                info!("  skipping table '{}' (not in --include list)", t.name);
+                return false;
+            }
+            // Step 2: exclude filter
+            if exclude.contains(&t.name) {
+                info!("  skipping table '{}' (in --exclude list)", t.name);
+                return false;
+            }
+            true
+        })
+        .collect();
+    filtered
 }
 
 /// Replace password in DSN for logging.
