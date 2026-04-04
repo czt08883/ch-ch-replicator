@@ -6,6 +6,7 @@ mod error;
 mod schema;
 mod sync;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -56,6 +57,12 @@ struct Cli {
     /// Applied after --include filtering.
     #[arg(long, value_delimiter = ',')]
     exclude: Option<Vec<String>>,
+
+    /// Columns to exclude from replication, as a comma-separated list of "table.column" pairs.
+    /// Example: --exclude-columns=orders.internal_id,users.password_hash
+    /// Excluded columns are omitted from schema creation, initial sync, and CDC.
+    #[arg(long, value_delimiter = ',')]
+    exclude_columns: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -106,13 +113,19 @@ async fn run(cli: Cli) -> Result<(), ReplicatorError> {
     // Parse configuration
     let include_tables = cli.include.unwrap_or_default();
     let exclude_tables = cli.exclude.unwrap_or_default();
-    let config = Arc::new(Config::new(&cli.src, &cli.dest, threads, cli.batch, include_tables, exclude_tables)?);
+    let exclude_columns = parse_exclude_columns(cli.exclude_columns.unwrap_or_default());
+    let config = Arc::new(Config::new(&cli.src, &cli.dest, threads, cli.batch, include_tables, exclude_tables, exclude_columns)?);
 
     if !config.include_tables.is_empty() {
         info!("  include:     {}", config.include_tables.join(", "));
     }
     if !config.exclude_tables.is_empty() {
         info!("  exclude:     {}", config.exclude_tables.join(", "));
+    }
+    if !config.exclude_columns.is_empty() {
+        for (table, cols) in &config.exclude_columns {
+            info!("  exclude-columns: {}.{{{}}}", table, cols.join(", "));
+        }
     }
 
     // Build HTTP clients
@@ -265,6 +278,29 @@ async fn wait_for_shutdown_signal() {
         tokio::signal::ctrl_c().await.ok();
         info!("Received Ctrl-C");
     }
+}
+
+/// Parse a list of "table.column" strings into a per-table exclusion map.
+/// Entries that don't contain a dot are logged as warnings and skipped.
+fn parse_exclude_columns(entries: Vec<String>) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in entries {
+        if let Some(dot) = entry.find('.') {
+            let table = entry[..dot].to_string();
+            let col = entry[dot + 1..].to_string();
+            if table.is_empty() || col.is_empty() {
+                warn!("--exclude-columns: ignoring malformed entry '{}' (expected table.column)", entry);
+                continue;
+            }
+            map.entry(table).or_default().push(col);
+        } else {
+            warn!(
+                "--exclude-columns: ignoring '{}' — must be in 'table.column' format",
+                entry
+            );
+        }
+    }
+    map
 }
 
 /// Filter a list of tables according to include/exclude lists.

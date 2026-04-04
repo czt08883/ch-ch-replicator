@@ -1,4 +1,5 @@
 use crate::error::{ReplicatorError, Result};
+use std::collections::HashMap;
 use url::Url;
 
 /// Parsed ClickHouse connection configuration.
@@ -122,6 +123,9 @@ pub struct Config {
     pub include_tables: Vec<String>,
     /// Tables to exclude from replication (applied after `include_tables`).
     pub exclude_tables: Vec<String>,
+    /// Per-table column exclusion map: table_name → list of column names to omit.
+    /// Columns in this map are excluded from DDL, initial sync SELECT, and CDC SELECT.
+    pub exclude_columns: HashMap<String, Vec<String>>,
 }
 
 impl Config {
@@ -132,6 +136,7 @@ impl Config {
         batch_size: usize,
         include_tables: Vec<String>,
         exclude_tables: Vec<String>,
+        exclude_columns: HashMap<String, Vec<String>>,
     ) -> Result<Self> {
         Ok(Self {
             source: ClickHouseConfig::from_dsn(src_dsn)?,
@@ -142,7 +147,16 @@ impl Config {
             checkpoint_path: "checkpoint.json".to_string(),
             include_tables,
             exclude_tables,
+            exclude_columns,
         })
+    }
+
+    /// Return the list of columns excluded for a given table (empty slice if none).
+    pub fn excluded_columns_for(&self, table: &str) -> &[String] {
+        self.exclude_columns
+            .get(table)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
@@ -266,6 +280,7 @@ mod tests {
             300_000,
             vec![],
             vec![],
+            HashMap::new(),
         )
         .unwrap();
         assert_eq!(cfg.threads, 3);
@@ -276,17 +291,36 @@ mod tests {
         assert_eq!(cfg.destination.database, "dst_db");
         assert!(cfg.include_tables.is_empty());
         assert!(cfg.exclude_tables.is_empty());
+        assert!(cfg.exclude_columns.is_empty());
     }
 
     #[test]
     fn test_config_bad_src_dsn_propagates_error() {
-        let err = Config::new("not-valid", "clickhouse://u:p@h:8123/db", 1, 300_000, vec![], vec![]).unwrap_err();
+        let err = Config::new("not-valid", "clickhouse://u:p@h:8123/db", 1, 300_000, vec![], vec![], HashMap::new()).unwrap_err();
         assert!(matches!(err, ReplicatorError::DsnParse(_)));
     }
 
     #[test]
     fn test_config_bad_dst_dsn_propagates_error() {
-        let err = Config::new("clickhouse://u:p@h:8123/db", "not-valid", 1, 300_000, vec![], vec![]).unwrap_err();
+        let err = Config::new("clickhouse://u:p@h:8123/db", "not-valid", 1, 300_000, vec![], vec![], HashMap::new()).unwrap_err();
         assert!(matches!(err, ReplicatorError::DsnParse(_)));
+    }
+
+    #[test]
+    fn test_config_exclude_columns_stored() {
+        let mut excl = HashMap::new();
+        excl.insert("orders".to_string(), vec!["secret".to_string()]);
+        let cfg = Config::new(
+            "clickhouse://u:p@src:8123/db",
+            "clickhouse://u:p@dst:8123/db",
+            1,
+            1000,
+            vec![],
+            vec![],
+            excl,
+        )
+        .unwrap();
+        assert_eq!(cfg.excluded_columns_for("orders"), &["secret"]);
+        assert!(cfg.excluded_columns_for("other").is_empty());
     }
 }
