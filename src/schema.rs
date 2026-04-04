@@ -388,6 +388,25 @@ pub async fn apply_ddl(client: &ClickHouseClient, ddl: &str) -> Result<()> {
     client.execute_no_db(ddl).await
 }
 
+/// Build an explicit SELECT column list for a table, excluding virtual and user-excluded columns.
+///
+/// Returns a comma-separated, backtick-quoted list of column names, e.g.:
+///   `` `id`, `name`, `ts` ``
+///
+/// If the resulting list would be empty (all columns excluded), returns `"*"` as a safe fallback.
+pub fn build_select_cols(columns: &[ColumnInfo], excluded: &[String]) -> String {
+    let cols: Vec<String> = columns
+        .iter()
+        .filter(|c| !is_virtual(&c.default_kind) && !excluded.contains(&c.name))
+        .map(|c| format!("`{}`", c.name))
+        .collect();
+    if cols.is_empty() {
+        "*".to_string()
+    } else {
+        cols.join(", ")
+    }
+}
+
 /// Fetch the current MAX value of a watermark column from the source table.
 /// Returns None if the table is empty or the query fails.
 pub async fn fetch_max_watermark(

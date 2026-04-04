@@ -175,7 +175,7 @@ impl CdcEngine {
         let limit = self.config.batch_size;
         let body = self
             .src
-            .select_delta_raw(&state.name, col, &wm_quoted, limit)
+            .select_delta_raw(&state.name, col, &wm_quoted, limit, "")
             .await?;
 
         let line_count = count_jsonl_lines(&body);
@@ -222,7 +222,7 @@ impl CdcEngine {
         // Fetch exactly the new rows (LIMIT from the end of known range)
         let body = self
             .src
-            .select_batch_raw(&state.name, dst_count, diff as usize + 1, &state.sorting_key)
+            .select_batch_raw(&state.name, dst_count, diff as usize + 1, &state.sorting_key, "")
             .await?;
 
         let line_count = count_jsonl_lines(&body);

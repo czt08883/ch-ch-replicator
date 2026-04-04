@@ -158,7 +158,7 @@ impl InitialSync {
                         }
                         match async {
                             let body = src
-                                .select_batch_raw(&table_name, offset, batch_size, &sorting_key)
+                                .select_batch_raw(&table_name, offset, batch_size, &sorting_key, "")
                                 .await?;
                             let lines = count_jsonl_lines(&body);
                             if lines > 0 {
