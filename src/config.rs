@@ -118,6 +118,10 @@ pub struct Config {
     pub cdc_poll_secs: u64,
     /// Path to the checkpoint file.
     pub checkpoint_path: String,
+    /// If non-empty, only replicate tables whose names are in this list.
+    pub include_tables: Vec<String>,
+    /// Tables to exclude from replication (applied after `include_tables`).
+    pub exclude_tables: Vec<String>,
 }
 
 impl Config {
@@ -126,6 +130,8 @@ impl Config {
         dest_dsn: &str,
         threads: usize,
         batch_size: usize,
+        include_tables: Vec<String>,
+        exclude_tables: Vec<String>,
     ) -> Result<Self> {
         Ok(Self {
             source: ClickHouseConfig::from_dsn(src_dsn)?,
@@ -134,6 +140,8 @@ impl Config {
             batch_size,
             cdc_poll_secs: 5,
             checkpoint_path: "checkpoint.json".to_string(),
+            include_tables,
+            exclude_tables,
         })
     }
 }
@@ -256,6 +264,8 @@ mod tests {
             "clickhouse://u:p@dst:8123/dst_db",
             3,
             300_000,
+            vec![],
+            vec![],
         )
         .unwrap();
         assert_eq!(cfg.threads, 3);
@@ -264,17 +274,19 @@ mod tests {
         assert_eq!(cfg.checkpoint_path, "checkpoint.json");
         assert_eq!(cfg.source.database, "src_db");
         assert_eq!(cfg.destination.database, "dst_db");
+        assert!(cfg.include_tables.is_empty());
+        assert!(cfg.exclude_tables.is_empty());
     }
 
     #[test]
     fn test_config_bad_src_dsn_propagates_error() {
-        let err = Config::new("not-valid", "clickhouse://u:p@h:8123/db", 1, 300_000).unwrap_err();
+        let err = Config::new("not-valid", "clickhouse://u:p@h:8123/db", 1, 300_000, vec![], vec![]).unwrap_err();
         assert!(matches!(err, ReplicatorError::DsnParse(_)));
     }
 
     #[test]
     fn test_config_bad_dst_dsn_propagates_error() {
-        let err = Config::new("clickhouse://u:p@h:8123/db", "not-valid", 1, 300_000).unwrap_err();
+        let err = Config::new("clickhouse://u:p@h:8123/db", "not-valid", 1, 300_000, vec![], vec![]).unwrap_err();
         assert!(matches!(err, ReplicatorError::DsnParse(_)));
     }
 }

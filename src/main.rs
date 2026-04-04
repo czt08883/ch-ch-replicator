@@ -46,6 +46,16 @@ struct Cli {
     /// Batch size for SELECT/INSERT during initial sync.
     #[arg(long, default_value = "300000")]
     batch: usize,
+
+    /// Comma-separated list of tables to replicate (whitelist).
+    /// If set, only these tables are replicated. Takes priority over --exclude.
+    #[arg(long, value_delimiter = ',')]
+    include: Option<Vec<String>>,
+
+    /// Comma-separated list of tables to skip (blacklist).
+    /// Applied after --include filtering.
+    #[arg(long, value_delimiter = ',')]
+    exclude: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -68,6 +78,7 @@ async fn main() {
         cli.threads,
         cli.batch,
     ));
+    // Note: --include/--exclude not included in proctitle (not sensitive, but keeps it short)
 
     if let Err(e) = run(cli).await {
         match e {
@@ -93,7 +104,16 @@ async fn run(cli: Cli) -> Result<(), ReplicatorError> {
     let threads = if cli.threads == 0 { 1 } else { cli.threads };
 
     // Parse configuration
-    let config = Arc::new(Config::new(&cli.src, &cli.dest, threads, cli.batch)?);
+    let include_tables = cli.include.unwrap_or_default();
+    let exclude_tables = cli.exclude.unwrap_or_default();
+    let config = Arc::new(Config::new(&cli.src, &cli.dest, threads, cli.batch, include_tables, exclude_tables)?);
+
+    if !config.include_tables.is_empty() {
+        info!("  include:     {}", config.include_tables.join(", "));
+    }
+    if !config.exclude_tables.is_empty() {
+        info!("  exclude:     {}", config.exclude_tables.join(", "));
+    }
 
     // Build HTTP clients
     let src_client = Arc::new(ClickHouseClient::new(config.source.clone())?);
