@@ -46,6 +46,16 @@ struct Cli {
     /// Batch size for SELECT/INSERT during initial sync.
     #[arg(long, default_value = "300000")]
     batch: usize,
+
+    /// Comma-separated list of tables to replicate (whitelist).
+    /// If set, only these tables are replicated. Takes priority over --exclude.
+    #[arg(long, value_delimiter = ',')]
+    include: Option<Vec<String>>,
+
+    /// Comma-separated list of tables to skip (blacklist).
+    /// Applied after --include filtering.
+    #[arg(long, value_delimiter = ',')]
+    exclude: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -68,6 +78,7 @@ async fn main() {
         cli.threads,
         cli.batch,
     ));
+    // Note: --include/--exclude not included in proctitle (not sensitive, but keeps it short)
 
     if let Err(e) = run(cli).await {
         match e {
@@ -93,7 +104,16 @@ async fn run(cli: Cli) -> Result<(), ReplicatorError> {
     let threads = if cli.threads == 0 { 1 } else { cli.threads };
 
     // Parse configuration
-    let config = Arc::new(Config::new(&cli.src, &cli.dest, threads, cli.batch)?);
+    let include_tables = cli.include.unwrap_or_default();
+    let exclude_tables = cli.exclude.unwrap_or_default();
+    let config = Arc::new(Config::new(&cli.src, &cli.dest, threads, cli.batch, include_tables, exclude_tables)?);
+
+    if !config.include_tables.is_empty() {
+        info!("  include:     {}", config.include_tables.join(", "));
+    }
+    if !config.exclude_tables.is_empty() {
+        info!("  exclude:     {}", config.exclude_tables.join(", "));
+    }
 
     // Build HTTP clients
     let src_client = Arc::new(ClickHouseClient::new(config.source.clone())?);
@@ -122,13 +142,21 @@ async fn run(cli: Cli) -> Result<(), ReplicatorError> {
 
     // Phase 2: Schema discovery
     info!("Discovering tables in source database '{}'…", config.source.database);
-    let tables = list_tables(&src_client).await?;
+    let all_tables = list_tables(&src_client).await?;
 
-    if tables.is_empty() {
+    if all_tables.is_empty() {
         warn!("No tables found in source database '{}' — nothing to replicate", config.source.database);
         return Ok(());
     }
-    info!("Found {} table(s) to replicate", tables.len());
+
+    // Apply --include / --exclude filters
+    let tables = filter_tables(all_tables, &config.include_tables, &config.exclude_tables);
+
+    if tables.is_empty() {
+        warn!("All tables were filtered out — nothing to replicate");
+        return Ok(());
+    }
+    info!("Replicating {} table(s)", tables.len());
     for t in &tables {
         info!("  - {} ({})", t.name, t.engine);
     }
@@ -239,6 +267,37 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
+/// Filter a list of tables according to include/exclude lists.
+///
+/// Algorithm:
+/// 1. If `include` is non-empty, keep only tables whose name is in the list.
+/// 2. Remove any table whose name is in `exclude`.
+///
+/// Both lists use exact, case-sensitive matching.
+fn filter_tables(
+    tables: Vec<crate::schema::TableInfo>,
+    include: &[String],
+    exclude: &[String],
+) -> Vec<crate::schema::TableInfo> {
+    let filtered: Vec<crate::schema::TableInfo> = tables
+        .into_iter()
+        .filter(|t| {
+            // Step 1: include filter
+            if !include.is_empty() && !include.contains(&t.name) {
+                info!("  skipping table '{}' (not in --include list)", t.name);
+                return false;
+            }
+            // Step 2: exclude filter
+            if exclude.contains(&t.name) {
+                info!("  skipping table '{}' (in --exclude list)", t.name);
+                return false;
+            }
+            true
+        })
+        .collect();
+    filtered
+}
+
 /// Replace password in DSN for logging.
 fn sanitize_dsn(dsn: &str) -> String {
     // Replace everything between ':' and '@' in the authority section
@@ -247,5 +306,90 @@ fn sanitize_dsn(dsn: &str) -> String {
         url.to_string()
     } else {
         "<invalid DSN>".to_string()
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use crate::schema::TableInfo;
+
+    fn make_tables(names: &[&str]) -> Vec<TableInfo> {
+        names.iter().map(|n| TableInfo {
+            name: n.to_string(),
+            engine: "MergeTree".to_string(),
+            sorting_key: String::new(),
+        }).collect()
+    }
+
+    fn names(tables: &[TableInfo]) -> Vec<&str> {
+        tables.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    #[test]
+    fn no_filters_returns_all() {
+        let tables = make_tables(&["a", "b", "c"]);
+        let result = filter_tables(tables, &[], &[]);
+        assert_eq!(names(&result), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn include_keeps_only_listed() {
+        let tables = make_tables(&["a", "b", "c"]);
+        let include = vec!["a".to_string(), "c".to_string()];
+        let result = filter_tables(tables, &include, &[]);
+        assert_eq!(names(&result), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn exclude_removes_listed() {
+        let tables = make_tables(&["a", "b", "c"]);
+        let exclude = vec!["b".to_string()];
+        let result = filter_tables(tables, &[], &exclude);
+        assert_eq!(names(&result), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn include_then_exclude_applied_in_order() {
+        // Include a,b,c then exclude b → result: a, c
+        let tables = make_tables(&["a", "b", "c", "d"]);
+        let include = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let exclude = vec!["b".to_string()];
+        let result = filter_tables(tables, &include, &exclude);
+        assert_eq!(names(&result), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn include_unknown_name_yields_empty() {
+        let tables = make_tables(&["a", "b"]);
+        let include = vec!["nonexistent".to_string()];
+        let result = filter_tables(tables, &include, &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn include_and_exclude_same_table_exclude_wins() {
+        // Include a,b and also exclude a → only b remains
+        let tables = make_tables(&["a", "b", "c"]);
+        let include = vec!["a".to_string(), "b".to_string()];
+        let exclude = vec!["a".to_string()];
+        let result = filter_tables(tables, &include, &exclude);
+        assert_eq!(names(&result), vec!["b"]);
+    }
+
+    #[test]
+    fn matching_is_case_sensitive() {
+        let tables = make_tables(&["Events", "events"]);
+        let include = vec!["events".to_string()];
+        let result = filter_tables(tables, &include, &[]);
+        assert_eq!(names(&result), vec!["events"]);
+    }
+
+    #[test]
+    fn exclude_all_yields_empty() {
+        let tables = make_tables(&["a", "b"]);
+        let exclude = vec!["a".to_string(), "b".to_string()];
+        let result = filter_tables(tables, &[], &exclude);
+        assert!(result.is_empty());
     }
 }

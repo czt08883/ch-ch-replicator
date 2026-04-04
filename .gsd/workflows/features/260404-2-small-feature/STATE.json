@@ -1,0 +1,32 @@
+{
+  "template": "small-feature",
+  "templateName": "Small Feature",
+  "description": "",
+  "branch": "gsd/small-feature/small-feature",
+  "phases": [
+    {
+      "name": "scope",
+      "index": 0,
+      "status": "active"
+    },
+    {
+      "name": "plan",
+      "index": 1,
+      "status": "pending"
+    },
+    {
+      "name": "implement",
+      "index": 2,
+      "status": "pending"
+    },
+    {
+      "name": "verify",
+      "index": 3,
+      "status": "pending"
+    }
+  ],
+  "currentPhase": 0,
+  "startedAt": "2026-04-04T15:07:23.669Z",
+  "updatedAt": "2026-04-04T15:07:23.669Z",
+  "artifactDir": "/home/czt08883/work/ch-ch-replicator/.gsd/workflows/features/260404-2-small-feature"
+}
