@@ -4,6 +4,10 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+const CDC_MAX_RETRIES: u32 = 5;
+const CDC_RETRY_BASE_MS: u64 = 1_000;
+const CDC_RETRY_CAP_MS: u64 = 60_000;
+
 use crate::checkpoint::Checkpoint;
 use crate::client::ClickHouseClient;
 use crate::config::Config;
@@ -151,7 +155,7 @@ impl CdcEngine {
                     return Ok(());
                 }
 
-                match self.poll_table(state).await {
+                match self.poll_table_with_retry(state).await {
                     Ok(rows_replicated) => {
                         if rows_replicated > 0 {
                             info!(
@@ -162,12 +166,45 @@ impl CdcEngine {
                     }
                     Err(ReplicatorError::Cancelled) => return Ok(()),
                     Err(e) => {
-                        // Log and continue — don't abort CDC for a single table error
-                        error!("CDC: table '{}' poll error: {}", state.name, e);
+                        // All retries exhausted — log and continue to next cycle
+                        error!(
+                            "CDC: table '{}' poll failed after {} retries, skipping cycle: {}",
+                            state.name, CDC_MAX_RETRIES, e
+                        );
                     }
                 }
             }
         }
+    }
+
+    /// Poll a single table with exponential backoff retry.
+    ///
+    /// Attempts `CDC_MAX_RETRIES` times. Delay starts at `CDC_RETRY_BASE_MS` and
+    /// doubles each attempt, capped at `CDC_RETRY_CAP_MS`. Cancellation is
+    /// respected during the sleep between retries.
+    async fn poll_table_with_retry(&self, state: &mut TableState) -> Result<usize> {
+        let mut delay_ms = CDC_RETRY_BASE_MS;
+        for attempt in 1..=CDC_MAX_RETRIES {
+            match self.poll_table(state).await {
+                Ok(n) => return Ok(n),
+                Err(ReplicatorError::Cancelled) => return Err(ReplicatorError::Cancelled),
+                Err(e) => {
+                    if attempt == CDC_MAX_RETRIES {
+                        return Err(e);
+                    }
+                    warn!(
+                        "CDC: table '{}' poll error (attempt {}/{}), retrying in {}ms: {}",
+                        state.name, attempt, CDC_MAX_RETRIES, delay_ms, e
+                    );
+                    tokio::select! {
+                        _ = self.cancel.cancelled() => return Err(ReplicatorError::Cancelled),
+                        _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                    }
+                    delay_ms = (delay_ms * 2).min(CDC_RETRY_CAP_MS);
+                }
+            }
+        }
+        unreachable!()
     }
 
     /// Poll a single table for new rows and replicate them.
@@ -528,5 +565,36 @@ mod tests {
         let (col, val) = watermark_initial_value(&WatermarkKind::None);
         assert_eq!(col, "");
         assert_eq!(val, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // CDC backoff delay calculation
+    // -----------------------------------------------------------------------
+
+    /// Verify the exponential backoff sequence matches the spec:
+    /// 1s → 2s → 4s → 8s → 16s (capped at 60s after that)
+    #[test]
+    fn backoff_sequence_doubles_and_caps() {
+        let mut delay = CDC_RETRY_BASE_MS;
+        let expected = [1_000u64, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000];
+        for &exp in &expected {
+            assert_eq!(delay, exp, "unexpected delay {}, want {}", delay, exp);
+            delay = (delay * 2).min(CDC_RETRY_CAP_MS);
+        }
+    }
+
+    #[test]
+    fn backoff_base_is_one_second() {
+        assert_eq!(CDC_RETRY_BASE_MS, 1_000);
+    }
+
+    #[test]
+    fn backoff_cap_is_sixty_seconds() {
+        assert_eq!(CDC_RETRY_CAP_MS, 60_000);
+    }
+
+    #[test]
+    fn backoff_max_retries_is_five() {
+        assert_eq!(CDC_MAX_RETRIES, 5);
     }
 }
