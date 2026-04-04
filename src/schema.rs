@@ -38,7 +38,7 @@ pub async fn list_tables(client: &ClickHouseClient) -> Result<Vec<TableInfo>> {
         "SELECT name, engine, sorting_key \
          FROM system.tables \
          WHERE database = '{}' \
-           AND engine NOT IN ('View','MaterializedView','LiveView','WindowView') \
+           AND engine NOT IN ('View','MaterializedView','LiveView','WindowView','Dictionary') \
          ORDER BY name",
         escape_string(&client.config.database)
     );
@@ -61,9 +61,27 @@ pub async fn list_tables(client: &ClickHouseClient) -> Result<Vec<TableInfo>> {
         .collect())
 }
 
+/// Returns the names of all dictionaries in the source database.
+pub async fn list_dictionaries(client: &ClickHouseClient) -> Result<Vec<String>> {
+    let sql = format!(
+        "SELECT name FROM system.tables \
+         WHERE database = '{}' AND engine = 'Dictionary' \
+         ORDER BY name",
+        escape_string(&client.config.database)
+    );
+
+    #[derive(Deserialize)]
+    struct Row {
+        name: String,
+    }
+
+    let rows: Vec<Row> = client.query_typed(&sql).await?;
+    Ok(rows.into_iter().map(|r| r.name).collect())
+}
+
 /// Adapt a DDL string from the source database to the destination database.
 /// - Replaces `src_db`.`table` with `dest_db`.`table`
-/// - Ensures the statement uses `CREATE TABLE IF NOT EXISTS`
+/// - Ensures the statement uses `CREATE TABLE IF NOT EXISTS` or `CREATE DICTIONARY IF NOT EXISTS`
 /// - Rewrites deprecated MergeTree engine syntax to the modern ORDER BY / PARTITION BY form
 pub(crate) fn adapt_ddl(ddl: &str, src_db: &str, table: &str, dest_db: &str) -> String {
     let ddl = ddl.replace(
@@ -79,6 +97,11 @@ pub(crate) fn adapt_ddl(ddl: &str, src_db: &str, table: &str, dest_db: &str) -> 
         ddl
     } else {
         ddl.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
+    };
+    let ddl = if ddl.contains("CREATE DICTIONARY IF NOT EXISTS") {
+        ddl
+    } else {
+        ddl.replacen("CREATE DICTIONARY ", "CREATE DICTIONARY IF NOT EXISTS ", 1)
     };
     rewrite_deprecated_engine_syntax(&ddl)
 }
@@ -500,6 +523,22 @@ mod tests {
     fn adapt_ddl_does_not_duplicate_if_not_exists() {
         let ddl = "CREATE TABLE IF NOT EXISTS `src`.`t` (id UInt64) ENGINE = MergeTree()";
         let out = adapt_ddl(ddl, "src", "t", "dst");
+        let count = out.matches("IF NOT EXISTS").count();
+        assert_eq!(count, 1, "expected exactly one IF NOT EXISTS, got: {}", out);
+    }
+
+    #[test]
+    fn adapt_ddl_dictionary_adds_if_not_exists() {
+        let ddl = "CREATE DICTIONARY `src`.`browsers` (`id` Int32, `name` String) PRIMARY KEY id SOURCE(FILE(PATH '/var/lib/clickhouse/user_files/browsers.csv' FORMAT 'CSVWithNames')) LIFETIME(MIN 0 MAX 1000) LAYOUT(HASHED())";
+        let out = adapt_ddl(ddl, "src", "browsers", "dst");
+        assert!(out.contains("CREATE DICTIONARY IF NOT EXISTS"), "got: {}", out);
+        assert!(out.contains("`dst`.`browsers`"), "got: {}", out);
+    }
+
+    #[test]
+    fn adapt_ddl_dictionary_does_not_duplicate_if_not_exists() {
+        let ddl = "CREATE DICTIONARY IF NOT EXISTS `src`.`browsers` (`id` Int32) PRIMARY KEY id SOURCE(FILE(PATH '/tmp/f')) LIFETIME(0) LAYOUT(HASHED())";
+        let out = adapt_ddl(ddl, "src", "browsers", "dst");
         let count = out.matches("IF NOT EXISTS").count();
         assert_eq!(count, 1, "expected exactly one IF NOT EXISTS, got: {}", out);
     }
