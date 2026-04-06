@@ -252,6 +252,7 @@ pub fn strip_excluded_columns(ddl: &str, excluded: &[String]) -> String {
 
     let lines: Vec<&str> = ddl.lines().collect();
     let mut in_columns = false;
+    let mut past_columns = false;
     let mut col_lines: Vec<String> = Vec::new();   // column definition lines to keep
     let mut before: Vec<&str> = Vec::new();        // lines before the column block
     let mut after: Vec<&str> = Vec::new();         // lines from ENGINE onwards
@@ -260,7 +261,10 @@ pub fn strip_excluded_columns(ddl: &str, excluded: &[String]) -> String {
 
     for line in &lines {
         let trimmed = line.trim();
-        if !in_columns {
+        if past_columns {
+            // We've passed the closing ")" — everything else is ENGINE, ORDER BY, etc.
+            after.push(line);
+        } else if !in_columns {
             // The column block starts on the line that is just "(" (or the opening
             // paren of CREATE TABLE ... (\n).
             if trimmed == "(" {
@@ -274,6 +278,7 @@ pub fn strip_excluded_columns(ddl: &str, excluded: &[String]) -> String {
             // In modern ClickHouse DDL the closing ")" is on its own line before ENGINE.
             if trimmed == ")" || trimmed.starts_with(')') {
                 in_columns = false;
+                past_columns = true;
                 after.push(line);
                 continue;
             }
@@ -1116,6 +1121,46 @@ mod tests {
         let result = strip_excluded_columns(ddl, &["secret".to_string()]);
         assert!(result.contains("ENGINE = MergeTree()"), "engine section lost: {}", result);
         assert!(result.contains("ORDER BY id"), "order by lost: {}", result);
+    }
+
+    #[test]
+    fn strip_excluded_engine_appears_after_columns() {
+        // Regression: ENGINE/ORDER BY must come AFTER the column block, not before it.
+        let ddl = sample_ddl();
+        let result = strip_excluded_columns(ddl, &["secret".to_string()]);
+        let engine_pos = result.find("ENGINE").expect("ENGINE not found");
+        let name_pos = result.find("`name`").expect("`name` not found");
+        assert!(
+            engine_pos > name_pos,
+            "ENGINE appeared before column definitions; got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn strip_excluded_engine_appears_after_columns_with_index() {
+        // Regression: table with a secondary INDEX inside the column block.
+        let ddl = concat!(
+            "CREATE TABLE IF NOT EXISTS `dst`.`payments`\n",
+            "(\n",
+            "    `id` UUID,\n",
+            "    `secret` String,\n",
+            "    `version` UInt64,\n",
+            "    INDEX idx_id id TYPE bloom_filter(0.01) GRANULARITY 64\n",
+            ")\n",
+            "ENGINE = ReplacingMergeTree(version)\n",
+            "ORDER BY id"
+        );
+        let result = strip_excluded_columns(ddl, &["secret".to_string()]);
+        assert!(!result.contains("`secret`"), "excluded column present: {}", result);
+        let engine_pos = result.find("ENGINE").expect("ENGINE not found");
+        let id_pos = result.find("`id`").expect("`id` not found");
+        assert!(
+            engine_pos > id_pos,
+            "ENGINE appeared before column definitions; got:\n{}",
+            result
+        );
+        assert!(result.contains("INDEX idx_id"), "INDEX line lost: {}", result);
     }
 
     // -----------------------------------------------------------------------
