@@ -357,6 +357,10 @@ impl ClickHouseClient {
             ("password", self.config.password.clone()),
             ("database", self.config.database.clone()),
             ("query", query),
+            // Don't let failing materialized views on the destination block
+            // base-table inserts.  The MV errors are still logged server-side,
+            // but the replicated row lands in the target table regardless.
+            ("materialized_views_ignore_errors", "1".to_string()),
         ];
 
         let content_length = body.len().to_string();
